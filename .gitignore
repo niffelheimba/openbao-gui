@@ -1,0 +1,8 @@
+/target/
+/src-tauri/target/
+/src-tauri/gen/
+*.pdb
+*.msi
+*.msix
+*.exe.sha256
+.DS_Store

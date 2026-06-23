@@ -1,0 +1,714 @@
+use std::process::Command;
+
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use x509_parser::extensions::{GeneralName, ParsedExtension};
+use x509_parser::prelude::*;
+
+use crate::config::{CertificateProfile, CertificatePurpose, RootConfig};
+use crate::error::{AppError, AppResult};
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RootInfo {
+    pub id: String,
+    pub subject: String,
+    pub issuer: String,
+    pub fingerprint: String,
+    pub not_before: String,
+    pub not_after: String,
+    pub installed: bool,
+    pub conflicting_subject: bool,
+    pub refreshable: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IssuedCertificate {
+    pub thumbprint: String,
+    pub subject: String,
+    pub not_after: String,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PersonalCertificate {
+    pub thumbprint: String,
+    pub subject: String,
+    pub simple_name: String,
+    pub not_before: String,
+    pub not_after: String,
+    pub has_private_key: bool,
+    pub eku_oids: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProfileCertificateStatus {
+    pub profile_id: String,
+    pub certificates: Vec<PersonalCertificate>,
+}
+
+pub struct PendingRequest {
+    pub csr_pem: String,
+    pub key_container: String,
+    directory: tempfile::TempDir,
+    accepted: bool,
+}
+
+impl PendingRequest {
+    pub fn generate(profile: &CertificateProfile, common_name: &str) -> AppResult<Self> {
+        validate_identity(common_name)?;
+        let directory = tempfile::tempdir().map_err(|_| {
+            AppError::Certificate("could not create a protected temporary directory".into())
+        })?;
+        let key_container = format!("OpenBao-{}-{}", profile.id, uuid::Uuid::new_v4());
+        let inf_path = directory.path().join("request.inf");
+        let csr_path = directory.path().join("request.req");
+        let key_usage = match profile.purpose {
+            CertificatePurpose::Mtls => "0xa0",
+            CertificatePurpose::DocumentSigning => "0xc0",
+            CertificatePurpose::CodeSigning => "0x80",
+        };
+        let escaped_cn = common_name.replace('"', "\"\"");
+        let inf = format!(
+            r#"[Version]
+Signature="$Windows NT$"
+
+[NewRequest]
+Subject="CN={escaped_cn}"
+Exportable=FALSE
+KeyLength=3072
+KeyAlgorithm=RSA
+HashAlgorithm=sha256
+KeySpec=0
+ProviderName="Microsoft Software Key Storage Provider"
+ProviderType=0
+MachineKeySet=FALSE
+RequestType=PKCS10
+KeyContainer="{key_container}"
+KeyUsage={key_usage}
+Silent=TRUE
+"#
+        );
+        std::fs::write(&inf_path, inf)
+            .map_err(|_| AppError::Certificate("could not write CSR instructions".into()))?;
+        let output = run_windows(
+            "certreq.exe",
+            &[
+                "-new",
+                "-q",
+                "-user",
+                path_text(&inf_path)?,
+                path_text(&csr_path)?,
+            ],
+        )?;
+        if !output.status.success() {
+            let _ = delete_key_container(&key_container);
+            return Err(AppError::Certificate(command_error(
+                "Windows could not generate the certificate request",
+                &output,
+            )));
+        }
+        let csr_pem = std::fs::read_to_string(&csr_path).map_err(|_| {
+            AppError::Certificate("Windows did not produce a certificate request".into())
+        })?;
+        if !csr_pem.contains("BEGIN NEW CERTIFICATE REQUEST")
+            && !csr_pem.contains("BEGIN CERTIFICATE REQUEST")
+        {
+            let _ = delete_key_container(&key_container);
+            return Err(AppError::Certificate(
+                "Windows produced an unexpected CSR format".into(),
+            ));
+        }
+        Ok(Self {
+            csr_pem,
+            key_container,
+            directory,
+            accepted: false,
+        })
+    }
+
+    pub fn accept(
+        mut self,
+        certificate_pem: &str,
+        chain_pems: &[String],
+        trusted_root_fingerprints: &[String],
+        expected_identity: &str,
+        expected_eku_oids: &[String],
+    ) -> AppResult<IssuedCertificate> {
+        let validation = validate_issued_certificate(
+            &self.csr_pem,
+            certificate_pem,
+            chain_pems,
+            trusted_root_fingerprints,
+            expected_identity,
+            expected_eku_oids,
+        );
+        let (metadata, intermediates) = match validation {
+            Ok(value) => value,
+            Err(error) => {
+                let _ = delete_key_container(&self.key_container);
+                return Err(error);
+            }
+        };
+        for (index, intermediate) in intermediates.iter().enumerate() {
+            let path = self
+                .directory
+                .path()
+                .join(format!("intermediate-{index}.cer"));
+            std::fs::write(&path, intermediate).map_err(|_| {
+                AppError::Certificate("could not stage the issuing certificate chain".into())
+            })?;
+            let output = run_windows(
+                "certutil.exe",
+                &["-user", "-addstore", "-f", "CA", path_text(&path)?],
+            )?;
+            if !output.status.success() {
+                return Err(AppError::Certificate(command_error(
+                    "Windows rejected an issuing CA certificate",
+                    &output,
+                )));
+            }
+        }
+        let cert_path = self.directory.path().join("certificate.cer");
+        std::fs::write(&cert_path, certificate_pem)
+            .map_err(|_| AppError::Certificate("could not stage the signed certificate".into()))?;
+        let output = run_windows(
+            "certreq.exe",
+            &["-accept", "-q", "-user", path_text(&cert_path)?],
+        )?;
+        if !output.status.success() {
+            let _ = delete_key_container(&self.key_container);
+            return Err(AppError::Certificate(command_error(
+                "Windows rejected the signed certificate",
+                &output,
+            )));
+        }
+        self.accepted = true;
+        Ok(metadata)
+    }
+}
+
+impl Drop for PendingRequest {
+    fn drop(&mut self) {
+        if !self.accepted {
+            let _ = delete_key_container(&self.key_container);
+        }
+    }
+}
+
+pub fn inspect_root(root: &RootConfig) -> AppResult<RootInfo> {
+    let parsed_pem = ::pem::parse(&root.pem)
+        .map_err(|_| AppError::Certificate("embedded root is invalid PEM".into()))?;
+    let (_, cert) = X509Certificate::from_der(parsed_pem.contents())
+        .map_err(|_| AppError::Certificate("embedded root is invalid X.509".into()))?;
+    let is_ca = cert
+        .basic_constraints()
+        .ok()
+        .flatten()
+        .map(|ext| ext.value.ca)
+        .unwrap_or(false);
+    if cert.subject() != cert.issuer() || !is_ca {
+        return Err(AppError::Certificate(format!(
+            "embedded certificate {} is not a self-signed CA",
+            root.id
+        )));
+    }
+    let fingerprint = hex::encode(Sha256::digest(parsed_pem.contents()));
+    let installed = root_is_installed(&fingerprint).unwrap_or(false);
+    let conflicting_subject =
+        subject_has_other_certificate(&cert.subject().to_string(), &fingerprint).unwrap_or(false);
+    Ok(RootInfo {
+        id: root.id.clone(),
+        subject: cert.subject().to_string(),
+        issuer: cert.issuer().to_string(),
+        fingerprint,
+        not_before: cert.validity().not_before.to_string(),
+        not_after: cert.validity().not_after.to_string(),
+        installed,
+        conflicting_subject,
+        refreshable: root.refresh_path.is_some(),
+    })
+}
+
+pub fn install_root(root: &RootConfig) -> AppResult<()> {
+    install_root_with_policy(root, false)
+}
+
+pub fn install_refreshed_root(root: &RootConfig) -> AppResult<()> {
+    install_root_with_policy(root, true)
+}
+
+fn install_root_with_policy(root: &RootConfig, allow_same_subject: bool) -> AppResult<()> {
+    let info = inspect_root(root)?;
+    if info.installed {
+        return Ok(());
+    }
+    if info.conflicting_subject && !allow_same_subject {
+        return Err(AppError::Certificate("a different root with the same subject is already installed; resolve the conflict manually".into()));
+    }
+    let directory = tempfile::tempdir().map_err(|_| {
+        AppError::Certificate("could not create a protected temporary directory".into())
+    })?;
+    let path = directory.path().join("root.cer");
+    std::fs::write(&path, &root.pem)
+        .map_err(|_| AppError::Certificate("could not stage the root certificate".into()))?;
+    let output = run_windows(
+        "certutil.exe",
+        &["-user", "-addstore", "-f", "Root", path_text(&path)?],
+    )?;
+    if !output.status.success() {
+        return Err(AppError::Certificate(command_error(
+            "Windows did not install the root certificate",
+            &output,
+        )));
+    }
+    if !root_is_installed(&info.fingerprint)? {
+        return Err(AppError::Certificate(
+            "root installation could not be verified".into(),
+        ));
+    }
+    Ok(())
+}
+
+pub fn remove_root(root: &RootConfig) -> AppResult<()> {
+    let info = inspect_root(root)?;
+    if !info.installed {
+        return Ok(());
+    }
+    let output = run_windows(
+        "certutil.exe",
+        &["-user", "-delstore", "Root", &info.fingerprint],
+    )?;
+    if !output.status.success() {
+        return Err(AppError::Certificate(command_error(
+            "Windows did not remove the root certificate",
+            &output,
+        )));
+    }
+    Ok(())
+}
+
+fn root_is_installed(fingerprint: &str) -> AppResult<bool> {
+    let output = run_windows("certutil.exe", &["-user", "-store", "Root", fingerprint])?;
+    Ok(output.status.success())
+}
+
+fn subject_has_other_certificate(subject: &str, fingerprint: &str) -> AppResult<bool> {
+    #[cfg(windows)]
+    {
+        use base64::Engine;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(subject.as_bytes());
+        let expected = fingerprint.to_ascii_uppercase();
+        let script = format!("$s=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{encoded}')); $f='{expected}'; if(Get-ChildItem Cert:\\CurrentUser\\Root | Where-Object {{$_.Subject -eq $s -and ($_.Thumbprint -replace ' ','') -ne $f}}){{exit 7}} else {{exit 0}}");
+        let output = run_windows(
+            "powershell.exe",
+            &[
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                &script,
+            ],
+        )?;
+        Ok(output.status.code() == Some(7))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (subject, fingerprint);
+        Err(AppError::Certificate(
+            "this operation is only supported on Windows".into(),
+        ))
+    }
+}
+
+fn delete_key_container(container: &str) -> AppResult<()> {
+    let output = run_windows(
+        "certutil.exe",
+        &[
+            "-user",
+            "-csp",
+            "Microsoft Software Key Storage Provider",
+            "-delkey",
+            container,
+        ],
+    )?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(AppError::Certificate(
+            "could not remove an orphaned key container".into(),
+        ))
+    }
+}
+
+fn validate_issued_certificate(
+    csr_pem: &str,
+    certificate_pem: &str,
+    chain_pems: &[String],
+    trusted_root_fingerprints: &[String],
+    identity: &str,
+    expected_eku_oids: &[String],
+) -> AppResult<(IssuedCertificate, Vec<String>)> {
+    let csr_der = decode_csr_pem(csr_pem)?;
+    let (_, csr) = X509CertificationRequest::from_der(&csr_der)
+        .map_err(|_| AppError::Certificate("generated CSR could not be parsed".into()))?;
+    let cert_pem = ::pem::parse(certificate_pem)
+        .map_err(|_| AppError::Certificate("OpenBao returned an invalid certificate PEM".into()))?;
+    let (_, cert) = X509Certificate::from_der(cert_pem.contents()).map_err(|_| {
+        AppError::Certificate("OpenBao returned an invalid X.509 certificate".into())
+    })?;
+    if !cert.validity().is_valid() {
+        return Err(AppError::Certificate(
+            "OpenBao returned a certificate that is not currently valid".into(),
+        ));
+    }
+    if csr.certification_request_info.subject_pki.raw != cert.public_key().raw {
+        return Err(AppError::Certificate(
+            "the signed certificate does not match the locally generated key".into(),
+        ));
+    }
+    let intermediates = validate_chain(&cert, chain_pems, trusted_root_fingerprints)?;
+    let cn_matches = cert
+        .subject()
+        .iter_common_name()
+        .filter_map(|value| value.as_str().ok())
+        .any(|value| value.eq_ignore_ascii_case(identity));
+    let san_matches =
+        cert.extensions()
+            .iter()
+            .any(|extension| match extension.parsed_extension() {
+                ParsedExtension::SubjectAlternativeName(san) => {
+                    san.general_names.iter().any(|name| match name {
+                        GeneralName::RFC822Name(value) | GeneralName::DNSName(value) => {
+                            value.eq_ignore_ascii_case(identity)
+                        }
+                        _ => false,
+                    })
+                }
+                _ => false,
+            });
+    if !cn_matches && !san_matches {
+        return Err(AppError::Certificate(
+            "the signed certificate identity does not match the authenticated user".into(),
+        ));
+    }
+    let actual_ekus = certificate_eku_oids(&cert);
+    for expected in expected_eku_oids {
+        if !actual_ekus.iter().any(|actual| actual == expected) {
+            return Err(AppError::Certificate(format!(
+                "the signed certificate is missing required EKU {expected}"
+            )));
+        }
+    }
+    Ok((
+        IssuedCertificate {
+            thumbprint: hex::encode(sha1::Sha1::digest(cert_pem.contents())),
+            subject: cert.subject().to_string(),
+            not_after: cert.validity().not_after.to_string(),
+            warnings: Vec::new(),
+        },
+        intermediates,
+    ))
+}
+
+pub fn list_personal_certificates() -> AppResult<Vec<PersonalCertificate>> {
+    let script = r#"$items = @(Get-ChildItem Cert:\CurrentUser\My | ForEach-Object { [pscustomobject]@{ thumbprint=$_.Thumbprint.ToLowerInvariant(); subject=$_.Subject; simpleName=$_.GetNameInfo([Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false); notBefore=$_.NotBefore.ToUniversalTime().ToString('o'); notAfter=$_.NotAfter.ToUniversalTime().ToString('o'); hasPrivateKey=$_.HasPrivateKey; ekuOids=@($_.EnhancedKeyUsageList | ForEach-Object { $_.ObjectId.Value }) } }); ConvertTo-Json -Compress -Depth 4 -InputObject $items"#;
+    let output = run_windows(
+        "powershell.exe",
+        &[
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            script,
+        ],
+    )?;
+    if !output.status.success() {
+        return Err(AppError::Certificate(command_error(
+            "Windows could not inspect the Personal certificate store",
+            &output,
+        )));
+    }
+    let text = String::from_utf8(output.stdout).map_err(|_| {
+        AppError::Certificate("Windows returned invalid certificate-store data".into())
+    })?;
+    if text.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    serde_json::from_str(&text).map_err(|_| {
+        AppError::Certificate("Windows returned malformed certificate-store data".into())
+    })
+}
+
+pub fn certificates_for_profile(
+    all: &[PersonalCertificate],
+    profile: &CertificateProfile,
+    identity: &str,
+) -> Vec<PersonalCertificate> {
+    all.iter()
+        .filter(|certificate| {
+            certificate.has_private_key
+                && certificate.simple_name.eq_ignore_ascii_case(identity)
+                && profile
+                    .expected_eku_oids
+                    .iter()
+                    .all(|expected| certificate.eku_oids.iter().any(|actual| actual == expected))
+        })
+        .cloned()
+        .collect()
+}
+
+struct ChainEntry {
+    pem: String,
+    der: Vec<u8>,
+    trusted_root: bool,
+}
+
+fn validate_chain(
+    leaf: &X509Certificate<'_>,
+    chain_pems: &[String],
+    trusted_root_fingerprints: &[String],
+) -> AppResult<Vec<String>> {
+    let entries = chain_pems
+        .iter()
+        .filter_map(|value| ::pem::parse(value).ok())
+        .filter(|block| block.tag() == "CERTIFICATE")
+        .map(|block| {
+            let fingerprint = hex::encode(Sha256::digest(block.contents()));
+            ChainEntry {
+                pem: ::pem::encode(&block),
+                der: block.contents().to_vec(),
+                trusted_root: trusted_root_fingerprints
+                    .iter()
+                    .any(|trusted| trusted.eq_ignore_ascii_case(&fingerprint)),
+            }
+        })
+        .collect::<Vec<_>>();
+    let mut current_der = leaf.as_raw().to_vec();
+    let mut intermediates = Vec::new();
+    let mut visited = std::collections::HashSet::new();
+    for _ in 0..entries.len().saturating_add(1) {
+        let (_, current) = X509Certificate::from_der(&current_der)
+            .map_err(|_| AppError::Certificate("certificate chain could not be parsed".into()))?;
+        let mut parent_match = None;
+        for (index, entry) in entries.iter().enumerate() {
+            if visited.contains(&index) {
+                continue;
+            }
+            let Ok((_, candidate)) = X509Certificate::from_der(&entry.der) else {
+                continue;
+            };
+            if current.issuer() == candidate.subject()
+                && current
+                    .verify_signature(Some(candidate.public_key()))
+                    .is_ok()
+            {
+                parent_match = Some((index, candidate.subject() == candidate.issuer()));
+                break;
+            }
+        }
+        let Some((index, self_signed)) = parent_match else {
+            return Err(AppError::Certificate(
+                "the signed certificate does not chain to an embedded root".into(),
+            ));
+        };
+        visited.insert(index);
+        if self_signed {
+            let (_, root) = X509Certificate::from_der(&entries[index].der).map_err(|_| {
+                AppError::Certificate("root certificate could not be parsed".into())
+            })?;
+            if !entries[index].trusted_root || root.verify_signature(None).is_err() {
+                return Err(AppError::Certificate(
+                    "the signed certificate chain ends at an untrusted root".into(),
+                ));
+            }
+            return Ok(intermediates);
+        }
+        intermediates.push(entries[index].pem.clone());
+        current_der = entries[index].der.clone();
+    }
+    Err(AppError::Certificate(
+        "the signed certificate chain contains a loop".into(),
+    ))
+}
+
+fn certificate_eku_oids(cert: &X509Certificate<'_>) -> Vec<String> {
+    let mut result = Vec::new();
+    for extension in cert.extensions() {
+        if let ParsedExtension::ExtendedKeyUsage(eku) = extension.parsed_extension() {
+            if eku.client_auth {
+                result.push("1.3.6.1.5.5.7.3.2".into());
+            }
+            if eku.code_signing {
+                result.push("1.3.6.1.5.5.7.3.3".into());
+            }
+            if eku.email_protection {
+                result.push("1.3.6.1.5.5.7.3.4".into());
+            }
+            result.extend(eku.other.iter().map(|oid| oid.to_id_string()));
+        }
+    }
+    result
+}
+
+fn decode_csr_pem(value: &str) -> AppResult<Vec<u8>> {
+    // certreq uses "NEW CERTIFICATE REQUEST", which the generic PEM parser accepts.
+    ::pem::parse(value)
+        .map(|block| block.contents().to_vec())
+        .map_err(|_| AppError::Certificate("Windows returned an invalid CSR PEM".into()))
+}
+
+fn validate_identity(value: &str) -> AppResult<()> {
+    if value.is_empty()
+        || value.len() > 253
+        || value
+            .chars()
+            .any(|c| c.is_control() || matches!(c, '\r' | '\n' | '\0'))
+    {
+        return Err(AppError::Certificate(
+            "the mapped certificate identity is invalid".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn path_text(path: &std::path::Path) -> AppResult<&str> {
+    path.to_str()
+        .ok_or_else(|| AppError::Certificate("temporary path is not valid Unicode".into()))
+}
+
+fn command_error(prefix: &str, output: &std::process::Output) -> String {
+    let detail = String::from_utf8_lossy(&output.stderr);
+    let safe = crate::redaction::redact(detail.trim());
+    if safe.is_empty() {
+        prefix.into()
+    } else {
+        format!("{prefix}: {}", safe.chars().take(240).collect::<String>())
+    }
+}
+
+#[cfg(windows)]
+fn run_windows(program: &str, args: &[&str]) -> AppResult<std::process::Output> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+    let system_root = std::env::var_os("SystemRoot")
+        .ok_or_else(|| AppError::Certificate("Windows SystemRoot is unavailable".into()))?;
+    let executable = match program.to_ascii_lowercase().as_str() {
+        "powershell.exe" => std::path::PathBuf::from(system_root)
+            .join("System32")
+            .join("WindowsPowerShell")
+            .join("v1.0")
+            .join("powershell.exe"),
+        "certreq.exe" | "certutil.exe" => std::path::PathBuf::from(system_root)
+            .join("System32")
+            .join(program),
+        _ => {
+            return Err(AppError::Certificate(
+                "refusing to start an unapproved Windows component".into(),
+            ));
+        }
+    };
+    Command::new(&executable)
+        .args(args)
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map_err(|_| {
+            AppError::Certificate(format!(
+                "required Windows component {program} could not be started"
+            ))
+        })
+}
+
+#[cfg(not(windows))]
+fn run_windows(_program: &str, _args: &[&str]) -> AppResult<std::process::Output> {
+    Err(AppError::Certificate(
+        "this operation is only supported on Windows".into(),
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_control_characters_in_identity() {
+        assert!(validate_identity("alice@example.test").is_ok());
+        assert!(validate_identity("alice\n[Extensions]").is_err());
+    }
+
+    #[test]
+    fn windows_personal_store_inventory_smoke_test() {
+        let certificates = list_personal_certificates().unwrap();
+        assert!(certificates.iter().all(|certificate| {
+            certificate.thumbprint.len() == 40
+                && certificate
+                    .thumbprint
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit())
+        }));
+    }
+
+    #[test]
+    fn profile_inventory_requires_identity_key_and_all_ekus() {
+        let profile = CertificateProfile {
+            id: "mtls".into(),
+            label: "mTLS".into(),
+            description: String::new(),
+            purpose: CertificatePurpose::Mtls,
+            pki_mount: "pki".into(),
+            pki_role: "mtls".into(),
+            subject_claim: "email".into(),
+            san_claim: Some("email".into()),
+            destination_store: "My".into(),
+            key_algorithm: "rsa-3072".into(),
+            expected_eku_oids: vec!["1.3.6.1.5.5.7.3.2".into()],
+        };
+        let matching = PersonalCertificate {
+            thumbprint: "a".repeat(40),
+            subject: "CN=alice@example.test".into(),
+            simple_name: "alice@example.test".into(),
+            not_before: "2026-01-01T00:00:00Z".into(),
+            not_after: "2027-01-01T00:00:00Z".into(),
+            has_private_key: true,
+            eku_oids: vec!["1.3.6.1.5.5.7.3.2".into()],
+        };
+        let mut wrong_identity = matching.clone();
+        wrong_identity.subject = "CN=bob@example.test".into();
+        wrong_identity.simple_name = "bob@example.test".into();
+        let mut no_key = matching.clone();
+        no_key.has_private_key = false;
+        assert_eq!(
+            certificates_for_profile(
+                &[matching, wrong_identity, no_key],
+                &profile,
+                "alice@example.test"
+            )
+            .len(),
+            1
+        );
+    }
+
+    #[test]
+    #[ignore = "mutates and then removes a Current User CNG key container"]
+    fn windows_cng_request_smoke_test() {
+        let profile = CertificateProfile {
+            id: "smoke".into(),
+            label: "Smoke".into(),
+            description: String::new(),
+            purpose: CertificatePurpose::Mtls,
+            pki_mount: "pki".into(),
+            pki_role: "test".into(),
+            subject_claim: "email".into(),
+            san_claim: Some("email".into()),
+            destination_store: "My".into(),
+            key_algorithm: "rsa-3072".into(),
+            expected_eku_oids: vec!["1.3.6.1.5.5.7.3.2".into()],
+        };
+        let request = PendingRequest::generate(&profile, "smoke@example.test").unwrap();
+        assert!(request.csr_pem.contains("CERTIFICATE REQUEST"));
+        drop(request);
+    }
+}

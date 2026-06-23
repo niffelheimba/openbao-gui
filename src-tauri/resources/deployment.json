@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "configured": false,
+  "deployment_name": "Unconfigured homelab",
+  "openbao": {
+    "address": "https://openbao.example.invalid:8200",
+    "namespace": null,
+    "auth_mount": "oidc",
+    "oidc_role": "desktop-certificates",
+    "minimum_version": "2.5.5"
+  },
+  "identity": {
+    "display_claim": "preferred_username",
+    "subject_claim": "email"
+  },
+  "roots": [],
+  "profiles": []
+}

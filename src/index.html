@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="light dark" />
+    <title>OpenBao Certificates</title>
+    <link rel="stylesheet" href="styles.css" />
+    <script type="module" src="app.js"></script>
+  </head>
+  <body>
+    <main>
+      <header>
+        <div>
+          <p class="eyebrow">OPENBAO</p>
+          <h1>Certificates</h1>
+        </div>
+        <span id="connection-badge" class="badge neutral">Checking…</span>
+      </header>
+
+      <section id="configuration-warning" class="notice warning" hidden></section>
+      <section id="message" class="notice" hidden aria-live="polite"></section>
+
+      <section class="card">
+        <div class="section-heading">
+          <div>
+            <h2>Trust</h2>
+            <p>The homelab certificate authority trusted by this Windows account.</p>
+          </div>
+          <button id="refresh-roots" class="quiet">Refresh</button>
+        </div>
+        <div id="roots" class="stack"><p class="muted">Loading…</p></div>
+      </section>
+
+      <section class="card">
+        <div class="section-heading">
+          <div>
+            <h2>Session</h2>
+            <p id="session-summary">Not signed in.</p>
+          </div>
+          <button id="session-action" disabled>Sign in</button>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="section-heading">
+          <div>
+            <h2>Available certificates</h2>
+            <p>Private keys stay non-exportable in your Windows user profile.</p>
+          </div>
+        </div>
+        <div id="profiles" class="stack"><p class="muted">Sign in to continue.</p></div>
+      </section>
+
+      <footer>
+        <span id="deployment-name">Unconfigured deployment</span>
+        <span>v0.1.0</span>
+      </footer>
+    </main>
+  </body>
+</html>
