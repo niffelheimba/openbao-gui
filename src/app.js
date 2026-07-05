@@ -11,11 +11,20 @@ const els = {
   sessionAction: document.querySelector("#session-action"),
   deploymentName: document.querySelector("#deployment-name"),
   refreshRoots: document.querySelector("#refresh-roots"),
+  serverForm: document.querySelector("#server-settings"),
+  serverAddress: document.querySelector("#server-address"),
+  serverNamespace: document.querySelector("#server-namespace"),
+  authMount: document.querySelector("#auth-mount"),
+  oidcRole: document.querySelector("#oidc-role"),
+  serverSource: document.querySelector("#server-source"),
+  resetServer: document.querySelector("#reset-server"),
+  checkConnection: document.querySelector("#check-connection"),
 };
 
 let status;
 let loginPending = false;
 let certificateStatuses = new Map();
+let serverSettingsLoaded = false;
 
 function escapeHtml(value) {
   const node = document.createElement("span");
@@ -37,6 +46,19 @@ async function refresh() {
     els.warning.textContent = status.configured ? "" : status.configurationMessage;
     els.badge.textContent = status.configured ? "Configured" : "Setup required";
     els.badge.className = `badge ${status.configured ? "good" : "bad"}`;
+    if (!serverSettingsLoaded) {
+      els.serverAddress.value = status.serverSettings.address;
+      els.serverNamespace.value = status.serverSettings.namespace ?? "";
+      els.authMount.value = status.serverSettings.authMount;
+      els.oidcRole.value = status.serverSettings.oidcRole;
+      serverSettingsLoaded = true;
+    }
+    els.serverSource.textContent = status.serverOverride ? "Using per-user settings" : "Using embedded defaults";
+    els.resetServer.disabled = !status.serverOverride || Boolean(status.session) || loginPending;
+    els.checkConnection.disabled = !status.configured;
+    for (const control of els.serverForm.querySelectorAll("input, button[type=submit]")) {
+      control.disabled = Boolean(status.session) || loginPending;
+    }
     renderSession();
     await refreshRoots();
     await refreshCertificateStatus();
@@ -171,5 +193,37 @@ els.sessionAction.addEventListener("click", async () => {
 });
 
 els.refreshRoots.addEventListener("click", refreshRoots);
+els.checkConnection.addEventListener("click", async () => {
+  els.checkConnection.disabled = true;
+  showMessage("Checking OpenBao over Windows-trusted HTTPS…");
+  try {
+    const health = await invoke("check_openbao_connection");
+    showMessage(`OpenBao connection trusted. Server version ${health.version}.`);
+  } catch (error) {
+    showMessage(String(error), "error");
+  } finally {
+    els.checkConnection.disabled = false;
+  }
+});
+els.serverForm.addEventListener("submit", async event => {
+  event.preventDefault();
+  try {
+    await invoke("save_server_settings", { settings: {
+      schemaVersion: 1,
+      address: els.serverAddress.value.trim(),
+      namespace: els.serverNamespace.value.trim() || null,
+      authMount: els.authMount.value.trim(),
+      oidcRole: els.oidcRole.value.trim(),
+    }});
+    showMessage("Server settings saved. Exit from the tray and reopen the application to apply them.");
+  } catch (error) { showMessage(String(error), "error"); }
+});
+els.resetServer.addEventListener("click", async () => {
+  if (!confirm("Remove the per-user server override and return to the server embedded by your administrator?")) return;
+  try {
+    await invoke("reset_server_settings");
+    showMessage("Server override removed. Exit from the tray and reopen the application to apply the embedded defaults.");
+  } catch (error) { showMessage(String(error), "error"); }
+});
 listen("session-changed", refresh);
 refresh();

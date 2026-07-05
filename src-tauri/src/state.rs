@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use secrecy::SecretString;
@@ -45,15 +46,23 @@ pub struct RuntimeState {
 pub struct AppState {
     pub config: DeploymentConfig,
     pub api: OpenBaoClient,
+    pub server_settings_path: PathBuf,
+    pub server_override: bool,
     pub runtime: Arc<Mutex<RuntimeState>>,
 }
 
 impl AppState {
-    pub fn new(config: DeploymentConfig) -> crate::error::AppResult<Self> {
+    pub fn new(
+        config: DeploymentConfig,
+        server_settings_path: PathBuf,
+        server_override: bool,
+    ) -> crate::error::AppResult<Self> {
         let api = OpenBaoClient::new(&config)?;
         Ok(Self {
             config,
             api,
+            server_settings_path,
+            server_override,
             runtime: Arc::new(Mutex::new(RuntimeState {
                 session: None,
                 login_cancel: None,

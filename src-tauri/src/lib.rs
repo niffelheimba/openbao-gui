@@ -5,11 +5,13 @@ mod error;
 mod redaction;
 mod state;
 
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use api::{OidcChallenge, PkiSignRequest, PollResult};
-use certificates::{IssuedCertificate, PendingRequest, ProfileCertificateStatus, RootInfo};
-use config::{CertificateProfile, DeploymentConfig};
+use api::{OidcChallenge, PkiSignRequest, PollResult, ServerHealth};
+use certificates::{
+    AcceptancePolicy, IssuedCertificate, PendingRequest, ProfileCertificateStatus, RootInfo,
+};
+use config::{CertificateProfile, DeploymentConfig, ServerSettings};
 use error::{AppError, AppResult};
 use secrecy::{ExposeSecret, SecretString};
 use serde::Serialize;
@@ -26,6 +28,8 @@ struct AppStatus {
     deployment_name: String,
     session: Option<PublicSession>,
     profiles: Vec<CertificateProfile>,
+    server_settings: ServerSettings,
+    server_override: bool,
 }
 
 #[tauri::command]
@@ -36,12 +40,58 @@ async fn get_app_status(state: tauri::State<'_, AppState>) -> AppResult<AppStatu
         configuration_message: if state.config.configured {
             String::new()
         } else {
-            "Replace src-tauri/resources/deployment.json with your validated homelab configuration before distributing this build.".into()
+            "This build has no embedded trust roots or certificate profiles. Configure deployment.json before distributing it; the server endpoint itself may be changed below.".into()
         },
         deployment_name: state.config.deployment_name.clone(),
         session: runtime.session.as_ref().map(PublicSession::from),
         profiles: state.config.profiles.clone(),
+        server_settings: ServerSettings::from(&state.config.openbao),
+        server_override: state.server_override,
     })
+}
+
+fn ensure_server_settings_editable(runtime: &state::RuntimeState) -> AppResult<()> {
+    if runtime.session.is_some() || runtime.login_cancel.is_some() {
+        return Err(AppError::Configuration(
+            "sign out or cancel authentication before changing server settings".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn save_server_settings(
+    settings: ServerSettings,
+    state: tauri::State<'_, AppState>,
+) -> AppResult<()> {
+    let runtime = state.runtime.lock().await;
+    ensure_server_settings_editable(&runtime)?;
+    drop(runtime);
+    state.config.validate_server_settings(&settings)?;
+    let parent = state.server_settings_path.parent().ok_or_else(|| {
+        AppError::Configuration("server settings path has no parent directory".into())
+    })?;
+    std::fs::create_dir_all(parent).map_err(|_| {
+        AppError::Configuration("server settings directory could not be created".into())
+    })?;
+    let json = serde_json::to_vec_pretty(&settings)
+        .map_err(|_| AppError::Configuration("server settings could not be encoded".into()))?;
+    std::fs::write(&state.server_settings_path, json)
+        .map_err(|_| AppError::Configuration("server settings could not be saved".into()))
+}
+
+#[tauri::command]
+async fn reset_server_settings(state: tauri::State<'_, AppState>) -> AppResult<()> {
+    let runtime = state.runtime.lock().await;
+    ensure_server_settings_editable(&runtime)?;
+    drop(runtime);
+    match std::fs::remove_file(&state.server_settings_path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err(AppError::Configuration(
+            "saved server settings could not be removed".into(),
+        )),
+    }
 }
 
 #[tauri::command]
@@ -64,6 +114,26 @@ fn install_root(root_id: String, state: tauri::State<'_, AppState>) -> AppResult
         .find(|root| root.id == root_id)
         .ok_or_else(|| AppError::Certificate("unknown embedded root".into()))?;
     certificates::install_root(root)
+}
+
+#[tauri::command]
+async fn check_openbao_connection(state: tauri::State<'_, AppState>) -> AppResult<ServerHealth> {
+    ensure_configured(&state.config)?;
+    ensure_roots_installed(&state.config)?;
+    let health = state.api.server_health().await?;
+    let actual = semver::Version::parse(health.version.trim_start_matches('v'))
+        .map_err(|_| AppError::Api("OpenBao reported an invalid server version".into()))?;
+    let required =
+        semver::Version::parse(state.config.openbao.minimum_version.trim_start_matches('v'))
+            .map_err(|_| {
+                AppError::Configuration("minimum_version is not valid semantic versioning".into())
+            })?;
+    if actual < required {
+        return Err(AppError::Api(format!(
+            "OpenBao {required} or newer is required; server reported {actual}"
+        )));
+    }
+    Ok(health)
 }
 
 #[tauri::command]
@@ -143,11 +213,10 @@ async fn check_root_update(
         .refresh_path
         .clone()
         .ok_or_else(|| AppError::Certificate("this root has no refresh endpoint".into()))?;
-    let token = {
-        let runtime = state.runtime.lock().await;
-        let session = runtime.session.as_ref().ok_or(AppError::NotAuthenticated)?;
-        SecretString::from(session.token.expose_secret().to_owned())
-    };
+    let token = with_active_session(&state, |session| {
+        Ok(SecretString::from(session.token.expose_secret().to_owned()))
+    })
+    .await?;
     let pem = state.api.read_pem(&token, &path).await?;
     let block = pem::parse(&pem)
         .map_err(|_| AppError::Certificate("OpenBao returned invalid root PEM".into()))?;
@@ -195,11 +264,103 @@ async fn poll_until_complete(
             _ = tokio::time::sleep(Duration::from_secs(interval)) => {
                 match state.api.poll_oidc(&challenge, &state.config.identity.display_claim).await? {
                     PollResult::Pending => {},
-                    PollResult::SlowDown => interval = interval.saturating_mul(2).min(60),
-                    PollResult::Complete(session) => return Ok(session),
+                    PollResult::SlowDown => interval = interval.saturating_mul(2),
+                    PollResult::Complete(mut session) => {
+                        require_mapped_claim(
+                            &session,
+                            &state.config.identity.display_claim,
+                            "display identity",
+                        )?;
+                        require_mapped_claim(
+                            &session,
+                            &state.config.identity.subject_claim,
+                            "immutable subject",
+                        )?;
+                        session.identity = session
+                            .metadata
+                            .get(&state.config.identity.display_claim)
+                            .cloned()
+                            .ok_or(AppError::Internal)?;
+                        return Ok(session);
+                    }
                 }
             }
         }
+    }
+}
+
+fn require_mapped_claim(session: &state::Session, claim: &str, purpose: &str) -> AppResult<()> {
+    match session
+        .metadata
+        .get(claim)
+        .filter(|value| !value.trim().is_empty())
+    {
+        Some(_) => Ok(()),
+        None => Err(AppError::Configuration(format!(
+            "OpenBao OIDC metadata is missing required {purpose} claim '{claim}'"
+        ))),
+    }
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+async fn with_active_session<T>(
+    state: &tauri::State<'_, AppState>,
+    read: impl FnOnce(&state::Session) -> AppResult<T>,
+) -> AppResult<T> {
+    let mut runtime = state.runtime.lock().await;
+    if runtime
+        .session
+        .as_ref()
+        .is_some_and(|session| session.expires_at <= unix_now())
+    {
+        runtime.session = None;
+        return Err(AppError::NotAuthenticated);
+    }
+    let session = runtime.session.as_ref().ok_or(AppError::NotAuthenticated)?;
+    read(session)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn session_with_metadata(metadata: HashMap<String, String>) -> state::Session {
+        state::Session {
+            token: SecretString::from("test-token".to_owned()),
+            identity: "display".into(),
+            metadata,
+            expires_at: 0,
+            renewable: false,
+        }
+    }
+
+    #[test]
+    fn mapped_claim_requires_present_non_empty_metadata() {
+        let mut metadata = HashMap::new();
+        metadata.insert("sub".into(), "user-uuid".into());
+        let session = session_with_metadata(metadata);
+        assert!(require_mapped_claim(&session, "sub", "immutable subject").is_ok());
+        assert!(require_mapped_claim(&session, "preferred_username", "display identity").is_err());
+    }
+
+    #[test]
+    fn mapped_claim_rejects_blank_metadata() {
+        let mut metadata = HashMap::new();
+        metadata.insert("sub".into(), "   ".into());
+        let session = session_with_metadata(metadata);
+        assert!(require_mapped_claim(&session, "sub", "immutable subject").is_err());
+    }
+
+    #[test]
+    fn unix_now_is_nonzero() {
+        assert!(unix_now() > 0);
     }
 }
 
@@ -241,9 +402,7 @@ async fn issue_certificate(
         .find(|profile| profile.id == profile_id)
         .cloned()
         .ok_or_else(|| AppError::Certificate("unknown certificate profile".into()))?;
-    let (token, identity) = {
-        let runtime = state.runtime.lock().await;
-        let session = runtime.session.as_ref().ok_or(AppError::NotAuthenticated)?;
+    let (token, identity) = with_active_session(&state, |session| {
         let identity = session
             .metadata
             .get(&profile.subject_claim)
@@ -254,11 +413,12 @@ async fn issue_certificate(
                     profile.subject_claim
                 ))
             })?;
-        (
+        Ok((
             SecretString::from(session.token.expose_secret().to_owned()),
             identity,
-        )
-    };
+        ))
+    })
+    .await?;
     let profile_for_inventory = profile.clone();
     let identity_for_inventory = identity.clone();
     let existing = tokio::task::spawn_blocking(move || {
@@ -287,17 +447,14 @@ async fn issue_certificate(
     // The configured SAN claim must be present and server-side policy must bind it.
     let alt_name = profile.san_claim.as_ref();
     let alt_value = if let Some(claim) = alt_name {
-        let runtime = state.runtime.lock().await;
-        runtime
-            .session
-            .as_ref()
-            .and_then(|session| session.metadata.get(claim))
-            .cloned()
-            .ok_or_else(|| {
+        with_active_session(&state, |session| {
+            session.metadata.get(claim).cloned().ok_or_else(|| {
                 AppError::Certificate(format!(
                     "OIDC session is missing required mapped claim {claim}"
                 ))
-            })?
+            })
+        })
+        .await?
     } else {
         String::new()
     };
@@ -310,12 +467,19 @@ async fn issue_certificate(
             Some(&alt_value)
         },
         format: "pem",
+        exclude_cn_from_sans: alt_value.is_empty(),
     };
     let signed = state
         .api
         .sign_csr(&token, &profile.pki_mount, &profile.pki_role, &sign_request)
         .await?;
     let expected_ekus = profile.expected_eku_oids.clone();
+    let expected_purpose = profile.purpose.clone();
+    let expected_san = if alt_value.is_empty() {
+        None
+    } else {
+        Some(alt_value.clone())
+    };
     let mut chain = signed.ca_chain;
     if !signed.issuing_ca.is_empty() {
         chain.push(signed.issuing_ca);
@@ -331,9 +495,13 @@ async fn issue_certificate(
         pending.accept(
             &signed.certificate,
             &chain,
-            &trusted_root_fingerprints,
-            &identity,
-            &expected_ekus,
+            AcceptancePolicy {
+                trusted_root_fingerprints: &trusted_root_fingerprints,
+                expected_identity: &identity,
+                expected_san: expected_san.as_deref(),
+                expected_purpose: &expected_purpose,
+                expected_eku_oids: &expected_ekus,
+            },
         )
     })
     .await
@@ -351,9 +519,7 @@ async fn issue_certificate(
 async fn list_certificate_status(
     state: tauri::State<'_, AppState>,
 ) -> AppResult<Vec<ProfileCertificateStatus>> {
-    let identities = {
-        let runtime = state.runtime.lock().await;
-        let session = runtime.session.as_ref().ok_or(AppError::NotAuthenticated)?;
+    let identities = with_active_session(&state, |session| {
         state
             .config
             .profiles
@@ -371,8 +537,9 @@ async fn list_certificate_status(
                         ))
                     })
             })
-            .collect::<AppResult<Vec<_>>>()?
-    };
+            .collect::<AppResult<Vec<_>>>()
+    })
+    .await?;
     tokio::task::spawn_blocking(move || {
         let all = certificates::list_personal_certificates()?;
         Ok(identities
@@ -416,16 +583,12 @@ fn show_main(app: &tauri::AppHandle) {
 }
 
 async fn session_renewal_loop(app: tauri::AppHandle) {
-    use std::time::{SystemTime, UNIX_EPOCH};
     loop {
         tokio::time::sleep(Duration::from_secs(60)).await;
         let state = app.state::<AppState>();
         let candidate = {
             let runtime = state.runtime.lock().await;
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
+            let now = unix_now();
             runtime
                 .session
                 .as_ref()
@@ -444,10 +607,7 @@ async fn session_renewal_loop(app: tauri::AppHandle) {
         };
         match state.api.renew(&token).await {
             Ok((lease, renewable)) => {
-                let now = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
+                let now = unix_now();
                 let mut runtime = state.runtime.lock().await;
                 if let Some(session) = runtime
                     .session
@@ -486,15 +646,14 @@ pub fn run() {
         .without_time()
         .init();
 
-    let config =
-        DeploymentConfig::load_embedded().expect("embedded deployment configuration must be valid");
-    let state = AppState::new(config).expect("HTTP client must initialize");
     tauri::Builder::default()
-        .manage(state)
         .invoke_handler(tauri::generate_handler![
             get_app_status,
+            save_server_settings,
+            reset_server_settings,
             list_embedded_roots,
             install_root,
+            check_openbao_connection,
             remove_root,
             check_root_update,
             approve_root_update,
@@ -505,6 +664,20 @@ pub fn run() {
             issue_certificate
         ])
         .setup(|app| {
+            let settings_path = app
+                .path()
+                .app_config_dir()
+                .map_err(|error| {
+                    std::io::Error::other(format!("resolve app config path: {error}"))
+                })?
+                .join("server.json");
+            let (config, server_override) =
+                DeploymentConfig::load_with_server_settings(&settings_path)
+                    .map_err(|error| std::io::Error::other(error.to_string()))?;
+            let state = AppState::new(config, settings_path, server_override)
+                .map_err(|error| std::io::Error::other(error.to_string()))?;
+            app.manage(state);
+
             use tauri::menu::{Menu, MenuItem};
             use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
             let open_item =

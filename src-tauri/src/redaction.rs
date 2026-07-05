@@ -5,6 +5,11 @@ const SECRET_KEYS: &[&str] = &[
     "refresh_token",
     "id_token",
     "client_nonce",
+    "state",
+    "code",
+    "csr",
+    "pin",
+    "management_key",
     "private_key",
 ];
 
@@ -34,9 +39,13 @@ mod tests {
 
     #[test]
     fn redacts_query_and_json_secrets() {
-        let value = redact("token=abc123&x=1 client_token\":\"secret\", private_key=hidden");
+        let value = redact(
+            "token=abc123&x=1 client_token\":\"secret\", private_key=hidden csr=request pin=123456",
+        );
         assert!(!value.contains("abc123"));
         assert!(!value.contains("secret"));
         assert!(!value.contains("hidden"));
+        assert!(!value.contains("request"));
+        assert!(!value.contains("123456"));
     }
 }

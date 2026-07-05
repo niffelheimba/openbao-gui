@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use url::Url;
@@ -18,7 +20,7 @@ pub struct DeploymentConfig {
     pub profiles: Vec<CertificateProfile>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct OpenBaoConfig {
     pub address: Url,
@@ -26,6 +28,28 @@ pub struct OpenBaoConfig {
     pub auth_mount: String,
     pub oidc_role: String,
     pub minimum_version: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ServerSettings {
+    pub schema_version: u32,
+    pub address: Url,
+    pub namespace: Option<String>,
+    pub auth_mount: String,
+    pub oidc_role: String,
+}
+
+impl From<&OpenBaoConfig> for ServerSettings {
+    fn from(value: &OpenBaoConfig) -> Self {
+        Self {
+            schema_version: 1,
+            address: value.address.clone(),
+            namespace: value.namespace.clone(),
+            auth_mount: value.auth_mount.clone(),
+            oidc_role: value.oidc_role.clone(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -68,6 +92,24 @@ pub enum CertificatePurpose {
     CodeSigning,
 }
 
+impl CertificatePurpose {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Mtls => "mTLS",
+            Self::DocumentSigning => "document signing",
+            Self::CodeSigning => "code signing",
+        }
+    }
+
+    pub fn required_eku_oid(&self) -> &'static str {
+        match self {
+            Self::Mtls => "1.3.6.1.5.5.7.3.2",
+            Self::DocumentSigning => "1.3.6.1.4.1.311.10.3.12",
+            Self::CodeSigning => "1.3.6.1.5.5.7.3.3",
+        }
+    }
+}
+
 impl DeploymentConfig {
     pub fn load_embedded() -> AppResult<Self> {
         let config: Self = serde_json::from_str(EMBEDDED_DEPLOYMENT).map_err(|error| {
@@ -75,6 +117,41 @@ impl DeploymentConfig {
         })?;
         config.validate()?;
         Ok(config)
+    }
+
+    pub fn load_with_server_settings(path: &Path) -> AppResult<(Self, bool)> {
+        let mut config = Self::load_embedded()?;
+        if !path.exists() {
+            return Ok((config, false));
+        }
+        let text = std::fs::read_to_string(path).map_err(|_| {
+            AppError::Configuration("saved OpenBao server settings could not be read".into())
+        })?;
+        let settings: ServerSettings = serde_json::from_str(&text).map_err(|error| {
+            AppError::Configuration(format!(
+                "saved OpenBao server settings are invalid: {error}"
+            ))
+        })?;
+        config.apply_server_settings(&settings)?;
+        Ok((config, true))
+    }
+
+    pub fn apply_server_settings(&mut self, settings: &ServerSettings) -> AppResult<()> {
+        if settings.schema_version != 1 {
+            return Err(AppError::Configuration(
+                "server settings schema_version must be 1".into(),
+            ));
+        }
+        self.openbao.address = settings.address.clone();
+        self.openbao.namespace = settings.namespace.clone();
+        self.openbao.auth_mount = settings.auth_mount.clone();
+        self.openbao.oidc_role = settings.oidc_role.clone();
+        self.validate()
+    }
+
+    pub fn validate_server_settings(&self, settings: &ServerSettings) -> AppResult<()> {
+        let mut candidate = self.clone();
+        candidate.apply_server_settings(settings)
     }
 
     pub fn validate(&self) -> AppResult<()> {
@@ -95,6 +172,24 @@ impl DeploymentConfig {
         {
             return Err(AppError::Configuration(
                 "OpenBao address must not contain credentials".into(),
+            ));
+        }
+        if self.openbao.address.host_str().is_none()
+            || self.openbao.address.query().is_some()
+            || self.openbao.address.fragment().is_some()
+            || !matches!(self.openbao.address.path(), "" | "/")
+        {
+            return Err(AppError::Configuration(
+                "OpenBao address must be an HTTPS origin without a path, query, or fragment".into(),
+            ));
+        }
+        if self.openbao.namespace.as_ref().is_some_and(|namespace| {
+            namespace.is_empty()
+                || namespace.len() > 256
+                || namespace.chars().any(|character| character.is_control())
+        }) {
+            return Err(AppError::Configuration(
+                "OpenBao namespace is empty, too long, or contains control characters".into(),
             ));
         }
         validate_segment("auth_mount", &self.openbao.auth_mount)?;
@@ -156,6 +251,17 @@ impl DeploymentConfig {
                 return Err(AppError::Configuration(format!(
                     "profile {} must use My and rsa-3072 in v1",
                     profile.id
+                )));
+            }
+            let required_eku = profile.purpose.required_eku_oid();
+            if !profile
+                .expected_eku_oids
+                .iter()
+                .any(|oid| oid == required_eku)
+            {
+                return Err(AppError::Configuration(format!(
+                    "profile {} is missing required EKU {}",
+                    profile.id, required_eku
                 )));
             }
         }
@@ -264,5 +370,49 @@ mod tests {
         assert!(constant_time_text_eq("abc", "abc"));
         assert!(!constant_time_text_eq("abc", "abd"));
         assert!(!constant_time_text_eq("abc", "ab"));
+    }
+
+    #[test]
+    fn loads_valid_per_user_server_override() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("server.json");
+        std::fs::write(
+            &path,
+            r#"{"schemaVersion":1,"address":"https://bao.override.test:8200","namespace":"homelab","authMount":"kanidm","oidcRole":"desktop"}"#,
+        )
+        .unwrap();
+        let (config, overridden) = DeploymentConfig::load_with_server_settings(&path).unwrap();
+        assert!(overridden);
+        assert_eq!(
+            config.openbao.address.as_str(),
+            "https://bao.override.test:8200/"
+        );
+        assert_eq!(config.openbao.namespace.as_deref(), Some("homelab"));
+        assert_eq!(config.openbao.auth_mount, "kanidm");
+    }
+
+    #[test]
+    fn rejects_unsafe_per_user_server_override() {
+        let config = DeploymentConfig::load_embedded().unwrap();
+        let settings = ServerSettings {
+            schema_version: 1,
+            address: Url::parse("http://bao.override.test").unwrap(),
+            namespace: None,
+            auth_mount: "oidc".into(),
+            oidc_role: "desktop".into(),
+        };
+        assert!(config.validate_server_settings(&settings).is_err());
+    }
+
+    #[test]
+    fn certificate_purposes_define_required_ekus() {
+        assert_eq!(
+            CertificatePurpose::DocumentSigning.required_eku_oid(),
+            "1.3.6.1.4.1.311.10.3.12"
+        );
+        assert_eq!(
+            CertificatePurpose::DocumentSigning.label(),
+            "document signing"
+        );
     }
 }

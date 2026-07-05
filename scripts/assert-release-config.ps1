@@ -25,4 +25,31 @@ foreach ($root in @($config.roots)) {
     }
 }
 
+$requiredEkus = @{
+    'mtls' = '1.3.6.1.5.5.7.3.2'
+    'document-signing' = '1.3.6.1.4.1.311.10.3.12'
+    'code-signing' = '1.3.6.1.5.5.7.3.3'
+}
+
+$profileIds = @{}
+foreach ($profile in @($config.profiles)) {
+    if (-not $profile.id -or $profile.id -notmatch '^[A-Za-z0-9_-]+$') {
+        throw "Profile has an invalid id '$($profile.id)'."
+    }
+    if ($profileIds.ContainsKey($profile.id)) {
+        throw "Duplicate profile id '$($profile.id)'."
+    }
+    $profileIds[$profile.id] = $true
+    if (-not $requiredEkus.ContainsKey($profile.purpose)) {
+        throw "Profile '$($profile.id)' has unsupported purpose '$($profile.purpose)'."
+    }
+    $required = $requiredEkus[$profile.purpose]
+    if (@($profile.expected_eku_oids) -notcontains $required) {
+        throw "Profile '$($profile.id)' is missing required EKU $required."
+    }
+    if ($profile.destination_store -ne 'My' -or $profile.key_algorithm -ne 'rsa-3072') {
+        throw "Profile '$($profile.id)' must use CurrentUser\My and rsa-3072."
+    }
+}
+
 Write-Host "Release configuration accepted for $($config.deployment_name)."

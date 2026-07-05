@@ -11,6 +11,8 @@ The client is intentionally narrow:
 - Current User `Root` and `My` certificate stores
 - in-memory OpenBao sessions
 - locally generated, non-exportable RSA-3072 CNG keys
+- per-user OpenBao endpoint/auth settings, constrained to HTTPS and the embedded
+  trust policy
 
 The checked-in deployment file is deliberately unconfigured. See
 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) before building an installer.
@@ -24,6 +26,14 @@ Prerequisites:
 - WebView2 Runtime
 - Tauri CLI 2 (`cargo install tauri-cli --version '^2' --locked`)
 
+Check the local machine before building:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File ./scripts/check-prereqs.ps1
+```
+
+Add `-IncludeYubiKey` when preparing for the later hardware-backed-key milestone.
+
 ```powershell
 cargo test --workspace
 cargo tauri dev
@@ -32,9 +42,16 @@ cargo tauri dev
 Create an unsigned per-user NSIS installer and its checksum:
 
 ```powershell
-cargo tauri build --bundles nsis
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File ./scripts/write-checksums.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File ./scripts/build-installer.ps1 -Mode Preview
 ```
+
+Use `-Online` the first time on a fresh machine if Cargo has not cached the
+project dependencies yet.
+
+`Preview` mode is for smoke-testing the installer, tray behavior, settings UI,
+and unconfigured-state messaging. It may build with the placeholder deployment.
+Use `-Mode Release` only after `deployment.json` contains the real homelab root
+and OpenBao profiles; release mode runs the configuration guard before building.
 
 An unsigned installer is not authenticated by clicking **Run anyway**. Send the
 generated SHA-256 to users over a separate trusted channel and require them to
@@ -60,6 +77,17 @@ embedded deployment remains unconfigured or contains placeholder trust material.
   confirmation
 - CI tests, dependency audit, SBOM/checksum jobs, and operator documentation
 
-Real OIDC, certificate issuance, Office signing, and mTLS acceptance tests require
-the target homelab and Windows applications; their exact gates are documented in
+Production Kanidm OIDC, clean-VM installation, Office signing, SignTool, and
+YubiKey PIV-backed mTLS acceptance tests require the target homelab, Windows
+applications, and hardware; their exact gates are documented in
 [docs/TESTING.md](docs/TESTING.md).
+
+The [disposable contract lab](lab/README.md) can exercise real OpenBao OIDC/PKI
+behavior locally or through the manual **OpenBao contract lab** GitHub workflow
+without using the production deployment file. It covers direct OIDC polling,
+replay and cross-identity denial, Windows trust/leaf enrollment, CNG
+non-exportability, and an actual loopback mTLS handshake.
+
+YubiKey support is intentionally planned after the software-key v1 release. The
+current client does not bundle YubiKey Manager, does not write PIV slots, and
+does not import certificates onto hardware tokens yet.

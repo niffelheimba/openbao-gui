@@ -24,10 +24,47 @@
       <section class="card">
         <div class="section-heading">
           <div>
+            <h2>Server settings</h2>
+            <p>Enter the OpenBao URL. OpenBao selects and validates the configured OIDC provider.</p>
+          </div>
+        </div>
+        <form id="server-settings" class="settings-grid">
+          <label class="wide">OpenBao HTTPS address
+            <input id="server-address" type="url" required placeholder="https://bao.home.example:8200" />
+          </label>
+          <details class="wide advanced-settings">
+            <summary>Advanced OpenBao settings</summary>
+            <div class="settings-grid nested">
+              <label>Auth mount
+                <input id="auth-mount" required pattern="[A-Za-z0-9_-]+" />
+              </label>
+              <label>OIDC role
+                <input id="oidc-role" required pattern="[A-Za-z0-9_-]+" />
+              </label>
+              <label class="wide">Namespace <span class="muted">(optional)</span>
+                <input id="server-namespace" />
+              </label>
+            </div>
+          </details>
+          <p class="wide muted settings-note">The identity-provider issuer and client secret stay on OpenBao. Changing this URL never installs a new root certificate.</p>
+          <div class="form-actions wide">
+            <span id="server-source" class="muted"></span>
+            <button id="reset-server" type="button" class="quiet">Use embedded defaults</button>
+            <button type="submit">Save server</button>
+          </div>
+        </form>
+      </section>
+
+      <section class="card">
+        <div class="section-heading">
+          <div>
             <h2>Trust</h2>
             <p>The homelab certificate authority trusted by this Windows account.</p>
           </div>
-          <button id="refresh-roots" class="quiet">Refresh</button>
+          <div class="button-row">
+            <button id="check-connection" class="quiet">Check OpenBao</button>
+            <button id="refresh-roots" class="quiet">Refresh</button>
+          </div>
         </div>
         <div id="roots" class="stack"><p class="muted">Loading…</p></div>
       </section>

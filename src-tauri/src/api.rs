@@ -62,12 +62,19 @@ struct HealthData {
 }
 
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServerHealth {
+    pub version: String,
+}
+
+#[derive(Debug, Serialize)]
 pub struct PkiSignRequest<'a> {
     pub csr: &'a str,
     pub common_name: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub alt_names: Option<&'a str>,
     pub format: &'static str,
+    pub exclude_cn_from_sans: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -165,11 +172,7 @@ impl OpenBaoClient {
                 "OpenBao returned an unsafe OIDC authorization URL".into(),
             ));
         }
-        let poll_interval_seconds = data
-            .poll_interval
-            .parse::<u64>()
-            .map_err(|_| AppError::Api("OpenBao returned an invalid OIDC poll interval".into()))?
-            .clamp(1, 60);
+        let poll_interval_seconds = parse_poll_interval(&data.poll_interval)?;
         Ok(OidcChallenge {
             auth_url: auth_url.to_string(),
             state: data.state,
@@ -178,7 +181,7 @@ impl OpenBaoClient {
         })
     }
 
-    pub async fn require_minimum_version(&self, minimum: &str) -> AppResult<()> {
+    pub async fn server_health(&self) -> AppResult<ServerHealth> {
         let response = self
             .http
             .get(self.url("sys/health")?)
@@ -189,6 +192,13 @@ impl OpenBaoClient {
         let health: HealthData = serde_json::from_str(&body).map_err(|_| {
             AppError::Api("OpenBao health response did not include a version".into())
         })?;
+        Ok(ServerHealth {
+            version: health.version,
+        })
+    }
+
+    pub async fn require_minimum_version(&self, minimum: &str) -> AppResult<()> {
+        let health = self.server_health().await?;
         let actual = semver::Version::parse(health.version.trim_start_matches('v'))
             .map_err(|_| AppError::Api("OpenBao reported an invalid server version".into()))?;
         let required = semver::Version::parse(minimum.trim_start_matches('v')).map_err(|_| {
@@ -377,6 +387,14 @@ fn user_safe_error(status: reqwest::StatusCode, errors: &[String]) -> String {
     }
 }
 
+fn parse_poll_interval(value: &str) -> AppResult<u64> {
+    value
+        .parse::<u64>()
+        .ok()
+        .filter(|interval| *interval > 0)
+        .ok_or_else(|| AppError::Api("OpenBao returned an invalid OIDC poll interval".into()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -390,6 +408,13 @@ mod tests {
     }
 
     #[test]
+    fn rejects_zero_poll_interval() {
+        assert_eq!(parse_poll_interval("60").unwrap(), 60);
+        assert!(parse_poll_interval("0").is_err());
+        assert!(parse_poll_interval("soon").is_err());
+    }
+
+    #[test]
     fn hides_forbidden_details() {
         assert_eq!(
             user_safe_error(
@@ -398,5 +423,19 @@ mod tests {
             ),
             "access was denied by OpenBao policy"
         );
+    }
+
+    #[test]
+    fn pki_sign_request_can_exclude_human_cn_from_sans() {
+        let request = PkiSignRequest {
+            csr: "-----BEGIN CERTIFICATE REQUEST-----\n-----END CERTIFICATE REQUEST-----",
+            common_name: "nicholas",
+            alt_names: None,
+            format: "pem",
+            exclude_cn_from_sans: true,
+        };
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["exclude_cn_from_sans"], true);
+        assert!(json.get("alt_names").is_none());
     }
 }

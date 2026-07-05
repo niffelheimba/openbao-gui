@@ -37,6 +37,10 @@ pub struct PersonalCertificate {
     pub thumbprint: String,
     pub subject: String,
     pub simple_name: String,
+    #[serde(default)]
+    pub dns_names: Vec<String>,
+    #[serde(default)]
+    pub email_names: Vec<String>,
     pub not_before: String,
     pub not_after: String,
     pub has_private_key: bool,
@@ -55,6 +59,14 @@ pub struct PendingRequest {
     pub key_container: String,
     directory: tempfile::TempDir,
     accepted: bool,
+}
+
+pub struct AcceptancePolicy<'a> {
+    pub trusted_root_fingerprints: &'a [String],
+    pub expected_identity: &'a str,
+    pub expected_san: Option<&'a str>,
+    pub expected_purpose: &'a CertificatePurpose,
+    pub expected_eku_oids: &'a [String],
 }
 
 impl PendingRequest {
@@ -134,18 +146,10 @@ Silent=TRUE
         mut self,
         certificate_pem: &str,
         chain_pems: &[String],
-        trusted_root_fingerprints: &[String],
-        expected_identity: &str,
-        expected_eku_oids: &[String],
+        policy: AcceptancePolicy<'_>,
     ) -> AppResult<IssuedCertificate> {
-        let validation = validate_issued_certificate(
-            &self.csr_pem,
-            certificate_pem,
-            chain_pems,
-            trusted_root_fingerprints,
-            expected_identity,
-            expected_eku_oids,
-        );
+        let validation =
+            validate_issued_certificate(&self.csr_pem, certificate_pem, chain_pems, &policy);
         let (metadata, intermediates) = match validation {
             Ok(value) => value,
             Err(error) => {
@@ -348,9 +352,7 @@ fn validate_issued_certificate(
     csr_pem: &str,
     certificate_pem: &str,
     chain_pems: &[String],
-    trusted_root_fingerprints: &[String],
-    identity: &str,
-    expected_eku_oids: &[String],
+    policy: &AcceptancePolicy<'_>,
 ) -> AppResult<(IssuedCertificate, Vec<String>)> {
     let csr_der = decode_csr_pem(csr_pem)?;
     let (_, csr) = X509CertificationRequest::from_der(&csr_der)
@@ -370,39 +372,47 @@ fn validate_issued_certificate(
             "the signed certificate does not match the locally generated key".into(),
         ));
     }
-    let intermediates = validate_chain(&cert, chain_pems, trusted_root_fingerprints)?;
+    let intermediates = validate_chain(&cert, chain_pems, policy.trusted_root_fingerprints)?;
     let cn_matches = cert
         .subject()
         .iter_common_name()
         .filter_map(|value| value.as_str().ok())
-        .any(|value| value.eq_ignore_ascii_case(identity));
-    let san_matches =
-        cert.extensions()
-            .iter()
-            .any(|extension| match extension.parsed_extension() {
-                ParsedExtension::SubjectAlternativeName(san) => {
-                    san.general_names.iter().any(|name| match name {
-                        GeneralName::RFC822Name(value) | GeneralName::DNSName(value) => {
-                            value.eq_ignore_ascii_case(identity)
-                        }
-                        _ => false,
-                    })
-                }
-                _ => false,
-            });
-    if !cn_matches && !san_matches {
+        .any(|value| value.eq_ignore_ascii_case(policy.expected_identity));
+    if !cn_matches {
         return Err(AppError::Certificate(
             "the signed certificate identity does not match the authenticated user".into(),
         ));
     }
+    if let Some(expected_san) = policy.expected_san {
+        let san_matches =
+            cert.extensions()
+                .iter()
+                .any(|extension| match extension.parsed_extension() {
+                    ParsedExtension::SubjectAlternativeName(san) => {
+                        san.general_names.iter().any(|name| match name {
+                            GeneralName::RFC822Name(value) | GeneralName::DNSName(value) => {
+                                value.eq_ignore_ascii_case(expected_san)
+                            }
+                            _ => false,
+                        })
+                    }
+                    _ => false,
+                });
+        if !san_matches {
+            return Err(AppError::Certificate(
+                "the signed certificate SAN does not match the authenticated user".into(),
+            ));
+        }
+    }
     let actual_ekus = certificate_eku_oids(&cert);
-    for expected in expected_eku_oids {
+    for expected in policy.expected_eku_oids {
         if !actual_ekus.iter().any(|actual| actual == expected) {
             return Err(AppError::Certificate(format!(
                 "the signed certificate is missing required EKU {expected}"
             )));
         }
     }
+    validate_key_usage_for_purpose(&cert, policy.expected_purpose)?;
     Ok((
         IssuedCertificate {
             thumbprint: hex::encode(sha1::Sha1::digest(cert_pem.contents())),
@@ -414,8 +424,38 @@ fn validate_issued_certificate(
     ))
 }
 
+fn validate_key_usage_for_purpose(
+    cert: &X509Certificate<'_>,
+    purpose: &CertificatePurpose,
+) -> AppResult<()> {
+    let usages = cert
+        .extensions()
+        .iter()
+        .find_map(|extension| match extension.parsed_extension() {
+            ParsedExtension::KeyUsage(usages) => Some(usages),
+            _ => None,
+        })
+        .ok_or_else(|| {
+            AppError::Certificate("the signed certificate is missing Key Usage".into())
+        })?;
+    let valid = match purpose {
+        CertificatePurpose::Mtls | CertificatePurpose::CodeSigning => usages.digital_signature(),
+        CertificatePurpose::DocumentSigning => {
+            usages.digital_signature() && usages.non_repudiation()
+        }
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(AppError::Certificate(format!(
+            "the signed certificate has the wrong Key Usage for {}",
+            purpose.label()
+        )))
+    }
+}
+
 pub fn list_personal_certificates() -> AppResult<Vec<PersonalCertificate>> {
-    let script = r#"$items = @(Get-ChildItem Cert:\CurrentUser\My | ForEach-Object { [pscustomobject]@{ thumbprint=$_.Thumbprint.ToLowerInvariant(); subject=$_.Subject; simpleName=$_.GetNameInfo([Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false); notBefore=$_.NotBefore.ToUniversalTime().ToString('o'); notAfter=$_.NotAfter.ToUniversalTime().ToString('o'); hasPrivateKey=$_.HasPrivateKey; ekuOids=@($_.EnhancedKeyUsageList | ForEach-Object { $_.ObjectId.Value }) } }); ConvertTo-Json -Compress -Depth 4 -InputObject $items"#;
+    let script = r#"[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false); $items = @(Get-ChildItem Cert:\CurrentUser\My | ForEach-Object { [pscustomobject]@{ thumbprint=$_.Thumbprint.ToLowerInvariant(); subject=$_.Subject; simpleName=$_.GetNameInfo([Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false); dnsNames=@($_.DnsNameList | ForEach-Object { if ($_.Unicode) { $_.Unicode } }); emailNames=@($_.GetNameInfo([Security.Cryptography.X509Certificates.X509NameType]::EmailName, $false) | Where-Object { $_ }); notBefore=$_.NotBefore.ToUniversalTime().ToString('o'); notAfter=$_.NotAfter.ToUniversalTime().ToString('o'); hasPrivateKey=$_.HasPrivateKey; ekuOids=@($_.EnhancedKeyUsageList | ForEach-Object { if ($_.ObjectId -and $_.ObjectId.Value) { $_.ObjectId.Value } }) } }); ConvertTo-Json -Compress -Depth 4 -InputObject $items"#;
     let output = run_windows(
         "powershell.exe",
         &[
@@ -451,7 +491,7 @@ pub fn certificates_for_profile(
     all.iter()
         .filter(|certificate| {
             certificate.has_private_key
-                && certificate.simple_name.eq_ignore_ascii_case(identity)
+                && certificate_matches_identity(certificate, identity)
                 && profile
                     .expected_eku_oids
                     .iter()
@@ -459,6 +499,23 @@ pub fn certificates_for_profile(
         })
         .cloned()
         .collect()
+}
+
+fn certificate_matches_identity(certificate: &PersonalCertificate, identity: &str) -> bool {
+    certificate.simple_name.eq_ignore_ascii_case(identity)
+        || certificate.subject.split(',').any(|part| {
+            part.trim()
+                .strip_prefix("CN=")
+                .is_some_and(|cn| cn.eq_ignore_ascii_case(identity))
+        })
+        || certificate
+            .dns_names
+            .iter()
+            .any(|value| value.eq_ignore_ascii_case(identity))
+        || certificate
+            .email_names
+            .iter()
+            .any(|value| value.eq_ignore_ascii_case(identity))
 }
 
 struct ChainEntry {
@@ -670,6 +727,8 @@ mod tests {
             thumbprint: "a".repeat(40),
             subject: "CN=alice@example.test".into(),
             simple_name: "alice@example.test".into(),
+            dns_names: Vec::new(),
+            email_names: vec!["alice@example.test".into()],
             not_before: "2026-01-01T00:00:00Z".into(),
             not_after: "2027-01-01T00:00:00Z".into(),
             has_private_key: true,
@@ -678,6 +737,7 @@ mod tests {
         let mut wrong_identity = matching.clone();
         wrong_identity.subject = "CN=bob@example.test".into();
         wrong_identity.simple_name = "bob@example.test".into();
+        wrong_identity.email_names = vec!["bob@example.test".into()];
         let mut no_key = matching.clone();
         no_key.has_private_key = false;
         assert_eq!(
@@ -689,6 +749,35 @@ mod tests {
             .len(),
             1
         );
+    }
+
+    #[test]
+    fn certificate_identity_can_match_cn_dns_or_email() {
+        let mut certificate = PersonalCertificate {
+            thumbprint: "a".repeat(40),
+            subject: "CN=alice".into(),
+            simple_name: String::new(),
+            dns_names: Vec::new(),
+            email_names: Vec::new(),
+            not_before: "2026-01-01T00:00:00Z".into(),
+            not_after: "2027-01-01T00:00:00Z".into(),
+            has_private_key: true,
+            eku_oids: Vec::new(),
+        };
+        assert!(certificate_matches_identity(&certificate, "alice"));
+        certificate.subject = "CN=other".into();
+        certificate.dns_names = vec!["alice".into()];
+        assert!(certificate_matches_identity(&certificate, "alice"));
+        certificate.dns_names.clear();
+        certificate.email_names = vec!["alice@example.test".into()];
+        assert!(certificate_matches_identity(
+            &certificate,
+            "alice@example.test"
+        ));
+        assert!(!certificate_matches_identity(
+            &certificate,
+            "bob@example.test"
+        ));
     }
 
     #[test]

@@ -1,0 +1,24 @@
+name: OpenBao contract lab
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  contract:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - shell: pwsh
+        run: powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ./lab/Run-ContractTests.ps1
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: openbao-contract-lab-logs
+          if-no-files-found: ignore
+          path: ${{ runner.temp }}/openbao-gui-contract-lab/**/logs/*
