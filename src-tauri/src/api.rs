@@ -58,13 +58,13 @@ struct AuthData {
 
 #[derive(Debug, Deserialize)]
 struct HealthData {
-    version: String,
+    version: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ServerHealth {
-    pub version: String,
+    pub version: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -137,7 +137,8 @@ impl OpenBaoClient {
         redirect_uri: &str,
         client_nonce: SecretString,
     ) -> AppResult<OidcChallenge> {
-        let url = self.url(&format!("auth/{}/oidc/auth_url", self.config.auth_mount))?;
+        let endpoint = format!("auth/{}/oidc/auth_url", self.config.auth_mount);
+        let url = self.url(&endpoint)?;
         let response = self
             .http
             .post(url)
@@ -149,6 +150,11 @@ impl OpenBaoClient {
             }))
             .send()
             .await?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Err(AppError::Api(format!(
+                "OIDC auth endpoint was not found at /v1/{endpoint}; verify the client's Auth mount setting matches the OpenBao auth method path"
+            )));
+        }
         let envelope: Envelope<AuthUrlData> = decode(response).await?;
         let data = envelope.data.ok_or_else(|| {
             AppError::Api(
@@ -188,10 +194,19 @@ impl OpenBaoClient {
             .headers(self.headers(None)?)
             .send()
             .await?;
+        let status = response.status();
         let body = response.text().await.unwrap_or_default();
-        let health: HealthData = serde_json::from_str(&body).map_err(|_| {
-            AppError::Api("OpenBao health response did not include a version".into())
-        })?;
+        let health: HealthData = match serde_json::from_str(&body) {
+            Ok(health) => health,
+            Err(error) => {
+                tracing::warn!(
+                    %status,
+                    error = %crate::redaction::redact(&error.to_string()),
+                    "OpenBao health response was not parseable JSON; treating version as unknown"
+                );
+                HealthData { version: None }
+            }
+        };
         Ok(ServerHealth {
             version: health.version,
         })
@@ -199,7 +214,13 @@ impl OpenBaoClient {
 
     pub async fn require_minimum_version(&self, minimum: &str) -> AppResult<()> {
         let health = self.server_health().await?;
-        let actual = semver::Version::parse(health.version.trim_start_matches('v'))
+        let Some(version) = health.version else {
+            tracing::warn!(
+                "OpenBao health response did not include a version; skipping minimum-version gate"
+            );
+            return Ok(());
+        };
+        let actual = semver::Version::parse(version.trim_start_matches('v'))
             .map_err(|_| AppError::Api("OpenBao reported an invalid server version".into()))?;
         let required = semver::Version::parse(minimum.trim_start_matches('v')).map_err(|_| {
             AppError::Configuration("minimum_version is not valid semantic versioning".into())

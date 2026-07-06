@@ -127,7 +127,8 @@ impl DeploymentConfig {
         let text = std::fs::read_to_string(path).map_err(|_| {
             AppError::Configuration("saved OpenBao server settings could not be read".into())
         })?;
-        let settings: ServerSettings = serde_json::from_str(&text).map_err(|error| {
+        let text = text.trim_start_matches('\u{feff}');
+        let settings: ServerSettings = serde_json::from_str(text).map_err(|error| {
             AppError::Configuration(format!(
                 "saved OpenBao server settings are invalid: {error}"
             ))
@@ -359,10 +360,12 @@ mod tests {
     #[test]
     fn builds_direct_callback_url() {
         let config = DeploymentConfig::load_embedded().unwrap();
-        assert_eq!(
-            config.oidc_callback_url().unwrap().as_str(),
-            "https://openbao.example.invalid:8200/v1/auth/oidc/oidc/callback"
+        let expected = format!(
+            "{}v1/auth/{}/oidc/callback",
+            config.openbao.address.as_str(),
+            config.openbao.auth_mount
         );
+        assert_eq!(config.oidc_callback_url().unwrap().as_str(), expected);
     }
 
     #[test]
@@ -389,6 +392,24 @@ mod tests {
         );
         assert_eq!(config.openbao.namespace.as_deref(), Some("homelab"));
         assert_eq!(config.openbao.auth_mount, "kanidm");
+    }
+
+    #[test]
+    fn loads_bom_prefixed_per_user_server_override() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("server.json");
+        std::fs::write(
+            &path,
+            "\u{feff}{\"schemaVersion\":1,\"address\":\"https://bao.override.test:8200\",\"namespace\":null,\"authMount\":\"oidc\",\"oidcRole\":\"northlake-users\"}",
+        )
+        .unwrap();
+        let (config, overridden) = DeploymentConfig::load_with_server_settings(&path).unwrap();
+        assert!(overridden);
+        assert_eq!(
+            config.openbao.address.as_str(),
+            "https://bao.override.test:8200/"
+        );
+        assert_eq!(config.openbao.oidc_role, "northlake-users");
     }
 
     #[test]

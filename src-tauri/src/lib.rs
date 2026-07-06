@@ -10,6 +10,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use api::{OidcChallenge, PkiSignRequest, PollResult, ServerHealth};
 use certificates::{
     AcceptancePolicy, IssuedCertificate, PendingRequest, ProfileCertificateStatus, RootInfo,
+    YubiKeyRequest,
 };
 use config::{CertificateProfile, DeploymentConfig, ServerSettings};
 use error::{AppError, AppResult};
@@ -121,17 +122,21 @@ async fn check_openbao_connection(state: tauri::State<'_, AppState>) -> AppResul
     ensure_configured(&state.config)?;
     ensure_roots_installed(&state.config)?;
     let health = state.api.server_health().await?;
-    let actual = semver::Version::parse(health.version.trim_start_matches('v'))
-        .map_err(|_| AppError::Api("OpenBao reported an invalid server version".into()))?;
-    let required =
-        semver::Version::parse(state.config.openbao.minimum_version.trim_start_matches('v'))
-            .map_err(|_| {
-                AppError::Configuration("minimum_version is not valid semantic versioning".into())
-            })?;
-    if actual < required {
-        return Err(AppError::Api(format!(
-            "OpenBao {required} or newer is required; server reported {actual}"
-        )));
+    if let Some(version) = &health.version {
+        let actual = semver::Version::parse(version.trim_start_matches('v'))
+            .map_err(|_| AppError::Api("OpenBao reported an invalid server version".into()))?;
+        let required =
+            semver::Version::parse(state.config.openbao.minimum_version.trim_start_matches('v'))
+                .map_err(|_| {
+                    AppError::Configuration(
+                        "minimum_version is not valid semantic versioning".into(),
+                    )
+                })?;
+        if actual < required {
+            return Err(AppError::Api(format!(
+                "OpenBao {required} or newer is required; server reported {actual}"
+            )));
+        }
     }
     Ok(health)
 }
@@ -515,6 +520,140 @@ async fn issue_certificate(
     Ok(issued)
 }
 
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct YubiKeyIssueRequest {
+    profile_id: String,
+    slot: String,
+    pin: String,
+    management_key: Option<String>,
+    algorithm: String,
+    pin_policy: String,
+    touch_policy: String,
+    replace_existing: bool,
+}
+
+#[tauri::command]
+async fn issue_yubikey_certificate(
+    request: YubiKeyIssueRequest,
+    state: tauri::State<'_, AppState>,
+) -> AppResult<IssuedCertificate> {
+    ensure_configured(&state.config)?;
+    let profile = state
+        .config
+        .profiles
+        .iter()
+        .find(|profile| profile.id == request.profile_id)
+        .cloned()
+        .ok_or_else(|| AppError::Certificate("unknown certificate profile".into()))?;
+    let (token, identity, alt_value) = with_active_session(&state, |session| {
+        let identity = session
+            .metadata
+            .get(&profile.subject_claim)
+            .cloned()
+            .ok_or_else(|| {
+                AppError::Certificate(format!(
+                    "OIDC session is missing required mapped claim {}",
+                    profile.subject_claim
+                ))
+            })?;
+        let alt_value = profile
+            .san_claim
+            .as_ref()
+            .map(|claim| {
+                session.metadata.get(claim).cloned().ok_or_else(|| {
+                    AppError::Certificate(format!(
+                        "OIDC session is missing required mapped claim {claim}"
+                    ))
+                })
+            })
+            .transpose()?
+            .unwrap_or_default();
+        Ok((
+            SecretString::from(session.token.expose_secret().to_owned()),
+            identity,
+            alt_value,
+        ))
+    })
+    .await?;
+
+    let yubikey_request = YubiKeyRequest {
+        slot: request.slot,
+        pin: request.pin,
+        management_key: request.management_key,
+        algorithm: request.algorithm,
+        pin_policy: request.pin_policy,
+        touch_policy: request.touch_policy,
+    };
+    let csr_profile = profile.clone();
+    let csr_identity = identity.clone();
+    let replace_existing = request.replace_existing;
+    let (csr_pem, directory, yubikey_request) = tokio::task::spawn_blocking(move || {
+        certificates::generate_yubikey_csr(
+            &csr_profile,
+            &csr_identity,
+            &yubikey_request,
+            replace_existing,
+        )
+        .map(|(csr, directory)| (csr, directory, yubikey_request))
+    })
+    .await
+    .map_err(|_| AppError::Internal)??;
+
+    let sign_request = PkiSignRequest {
+        csr: &csr_pem,
+        common_name: &identity,
+        alt_names: if alt_value.is_empty() {
+            None
+        } else {
+            Some(&alt_value)
+        },
+        format: "pem",
+        exclude_cn_from_sans: alt_value.is_empty(),
+    };
+    let signed = state
+        .api
+        .sign_csr(&token, &profile.pki_mount, &profile.pki_role, &sign_request)
+        .await?;
+    let expected_ekus = profile.expected_eku_oids.clone();
+    let expected_purpose = profile.purpose.clone();
+    let expected_san = if alt_value.is_empty() {
+        None
+    } else {
+        Some(alt_value.clone())
+    };
+    let mut chain = signed.ca_chain;
+    if !signed.issuing_ca.is_empty() {
+        chain.push(signed.issuing_ca);
+    }
+    chain.extend(state.config.roots.iter().map(|root| root.pem.clone()));
+    let trusted_root_fingerprints = state
+        .config
+        .roots
+        .iter()
+        .map(|root| root.sha256.clone())
+        .collect::<Vec<_>>();
+    let certificate = signed.certificate;
+    tokio::task::spawn_blocking(move || {
+        certificates::import_yubikey_certificate(
+            &yubikey_request,
+            directory,
+            &csr_pem,
+            &certificate,
+            &chain,
+            AcceptancePolicy {
+                trusted_root_fingerprints: &trusted_root_fingerprints,
+                expected_identity: &identity,
+                expected_san: expected_san.as_deref(),
+                expected_purpose: &expected_purpose,
+                expected_eku_oids: &expected_ekus,
+            },
+        )
+    })
+    .await
+    .map_err(|_| AppError::Internal)?
+}
+
 #[tauri::command]
 async fn list_certificate_status(
     state: tauri::State<'_, AppState>,
@@ -552,6 +691,13 @@ async fn list_certificate_status(
     })
     .await
     .map_err(|_| AppError::Internal)?
+}
+
+#[tauri::command]
+async fn list_all_personal_certificates() -> AppResult<Vec<certificates::PersonalCertificate>> {
+    tokio::task::spawn_blocking(certificates::list_personal_certificates)
+        .await
+        .map_err(|_| AppError::Internal)?
 }
 
 fn ensure_configured(config: &DeploymentConfig) -> AppResult<()> {
@@ -660,7 +806,9 @@ pub fn run() {
             login,
             cancel_login,
             logout,
+            list_all_personal_certificates,
             list_certificate_status,
+            issue_yubikey_certificate,
             issue_certificate
         ])
         .setup(|app| {
@@ -672,8 +820,18 @@ pub fn run() {
                 })?
                 .join("server.json");
             let (config, server_override) =
-                DeploymentConfig::load_with_server_settings(&settings_path)
-                    .map_err(|error| std::io::Error::other(error.to_string()))?;
+                match DeploymentConfig::load_with_server_settings(&settings_path) {
+                    Ok(result) => result,
+                    Err(error) => {
+                        tracing::warn!(
+                            error = %crate::redaction::redact(&error.to_string()),
+                            path = %settings_path.display(),
+                            "saved server settings could not be loaded; falling back to embedded deployment"
+                        );
+                        (DeploymentConfig::load_embedded()
+                            .map_err(|error| std::io::Error::other(error.to_string()))?, false)
+                    }
+                };
             let state = AppState::new(config, settings_path, server_override)
                 .map_err(|error| std::io::Error::other(error.to_string()))?;
             app.manage(state);

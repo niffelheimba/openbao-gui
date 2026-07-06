@@ -1,7 +1,8 @@
 use std::process::Command;
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use sha1::Digest;
+use sha2::Sha256;
 use x509_parser::extensions::{GeneralName, ParsedExtension};
 use x509_parser::prelude::*;
 
@@ -18,6 +19,7 @@ pub struct RootInfo {
     pub not_before: String,
     pub not_after: String,
     pub installed: bool,
+    pub machine_installed: bool,
     pub conflicting_subject: bool,
     pub refreshable: bool,
 }
@@ -53,6 +55,17 @@ pub struct ProfileCertificateStatus {
     pub profile_id: String,
     pub certificates: Vec<PersonalCertificate>,
 }
+
+pub struct YubiKeyRequest {
+    pub slot: String,
+    pub pin: String,
+    pub management_key: Option<String>,
+    pub algorithm: String,
+    pub pin_policy: String,
+    pub touch_policy: String,
+}
+
+const DEFAULT_YUBIKEY_MANAGEMENT_KEY: &str = "010203040506070801020304050607080102030405060708";
 
 pub struct PendingRequest {
     pub csr_pem: String,
@@ -195,6 +208,214 @@ Silent=TRUE
     }
 }
 
+pub fn generate_yubikey_csr(
+    _profile: &CertificateProfile,
+    common_name: &str,
+    request: &YubiKeyRequest,
+    _replace_existing: bool,
+) -> AppResult<(String, tempfile::TempDir)> {
+    validate_identity(common_name)?;
+    validate_yubikey_request(request)?;
+    let directory = tempfile::tempdir().map_err(|_| {
+        AppError::Certificate("could not create a protected temporary directory".into())
+    })?;
+    if yubikey_slot_has_key(&request.slot)? {
+        return Err(AppError::Certificate(format!(
+            "YubiKey PIV slot {} already contains a private key; choose another slot or clear it with YubiKey Manager before requesting a new certificate",
+            request.slot
+        )));
+    }
+    if yubikey_slot_has_certificate(&request.slot, directory.path())? {
+        return Err(AppError::Certificate(format!(
+            "YubiKey PIV slot {} already contains a certificate; choose another slot or clear it with YubiKey Manager before requesting a new certificate",
+            request.slot
+        )));
+    }
+    let public_key_path = directory.path().join("yubikey-public.pem");
+    let csr_path = directory.path().join("yubikey-request.pem");
+    let subject = format!("CN={}", common_name.replace(',', "\\,").replace('+', "\\+"));
+
+    let mut generate_args = vec![
+        "piv",
+        "keys",
+        "generate",
+        "--algorithm",
+        &request.algorithm,
+        "--pin-policy",
+        &request.pin_policy,
+        "--touch-policy",
+        &request.touch_policy,
+    ];
+    generate_args.push("--management-key");
+    generate_args.push(yubikey_management_key(request));
+    if !request.pin.is_empty() {
+        generate_args.push("--pin");
+        generate_args.push(&request.pin);
+    }
+    generate_args.push(&request.slot);
+    generate_args.push(path_text(&public_key_path)?);
+    let output = run_ykman(&generate_args)?;
+    if !output.status.success() {
+        return Err(AppError::Certificate(command_error(
+            "YubiKey Manager could not generate a PIV key",
+            &output,
+        )));
+    }
+
+    let output = match run_ykman(&[
+        "piv",
+        "certificates",
+        "request",
+        "--pin",
+        &request.pin,
+        "--subject",
+        &subject,
+        &request.slot,
+        path_text(&public_key_path)?,
+        path_text(&csr_path)?,
+    ]) {
+        Ok(output) => output,
+        Err(error) => {
+            let _ = delete_yubikey_key(request);
+            return Err(error);
+        }
+    };
+    if !output.status.success() {
+        let _ = delete_yubikey_key(request);
+        return Err(AppError::Certificate(command_error(
+            "YubiKey Manager could not generate a CSR",
+            &output,
+        )));
+    }
+    let csr_pem = std::fs::read_to_string(&csr_path).map_err(|_| {
+        let _ = delete_yubikey_key(request);
+        AppError::Certificate("YubiKey Manager did not produce a certificate request".into())
+    })?;
+    if !csr_pem.contains("BEGIN CERTIFICATE REQUEST") {
+        let _ = delete_yubikey_key(request);
+        return Err(AppError::Certificate(
+            "YubiKey Manager produced an unexpected CSR format".into(),
+        ));
+    }
+    Ok((csr_pem, directory))
+}
+
+pub fn import_yubikey_certificate(
+    request: &YubiKeyRequest,
+    directory: tempfile::TempDir,
+    csr_pem: &str,
+    certificate_pem: &str,
+    chain_pems: &[String],
+    policy: AcceptancePolicy<'_>,
+) -> AppResult<IssuedCertificate> {
+    let metadata = validate_issued_certificate(csr_pem, certificate_pem, chain_pems, &policy)
+        .map(|(metadata, _)| metadata)
+        .inspect_err(|_| {
+            let _ = delete_yubikey_key(request);
+        })?;
+    let cert_path = directory.path().join("yubikey-certificate.pem");
+    std::fs::write(&cert_path, certificate_pem).map_err(|_| {
+        let _ = delete_yubikey_key(request);
+        AppError::Certificate("could not stage the signed YubiKey certificate".into())
+    })?;
+    let mut args = vec![
+        "piv",
+        "certificates",
+        "import",
+        "--verify",
+        "--pin",
+        &request.pin,
+    ];
+    args.push("--management-key");
+    args.push(yubikey_management_key(request));
+    args.push(&request.slot);
+    args.push(path_text(&cert_path)?);
+    let output = run_ykman(&args)?;
+    if !output.status.success() {
+        let _ = delete_yubikey_key(request);
+        return Err(AppError::Certificate(command_error(
+            "YubiKey Manager could not import the signed certificate",
+            &output,
+        )));
+    }
+    Ok(metadata)
+}
+
+fn validate_yubikey_request(request: &YubiKeyRequest) -> AppResult<()> {
+    const SLOTS: &[&str] = &["9a", "9c", "9d", "9e"];
+    const ALGORITHMS: &[&str] = &["rsa2048", "rsa3072", "rsa4096", "eccp256", "eccp384"];
+    const PIN_POLICIES: &[&str] = &["default", "never", "once", "always"];
+    const TOUCH_POLICIES: &[&str] = &["default", "never", "always", "cached"];
+    if !SLOTS.contains(&request.slot.as_str()) {
+        return Err(AppError::Certificate(
+            "unsupported YubiKey PIV slot; choose 9a, 9c, 9d, or 9e".into(),
+        ));
+    }
+    if !ALGORITHMS.contains(&request.algorithm.as_str()) {
+        return Err(AppError::Certificate(
+            "unsupported YubiKey key algorithm".into(),
+        ));
+    }
+    if !PIN_POLICIES.contains(&request.pin_policy.as_str()) {
+        return Err(AppError::Certificate(
+            "unsupported YubiKey PIN policy".into(),
+        ));
+    }
+    if !TOUCH_POLICIES.contains(&request.touch_policy.as_str()) {
+        return Err(AppError::Certificate(
+            "unsupported YubiKey touch policy".into(),
+        ));
+    }
+    if request.pin.trim().is_empty() {
+        return Err(AppError::Certificate(
+            "YubiKey PIV PIN is required for this operation".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn yubikey_slot_has_certificate(slot: &str, directory: &std::path::Path) -> AppResult<bool> {
+    let path = directory.join("existing-yubikey-certificate.pem");
+    let output = run_ykman(&["piv", "certificates", "export", slot, path_text(&path)?])?;
+    Ok(output.status.success() && path.exists())
+}
+
+fn yubikey_slot_has_key(slot: &str) -> AppResult<bool> {
+    let output = run_ykman(&["piv", "keys", "info", slot])?;
+    let text = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+    .to_ascii_lowercase();
+    if output.status.success() {
+        return Ok(true);
+    }
+    Ok(!(text.contains("no key")
+        || text.contains("not found")
+        || text.contains("object not found")
+        || text.contains("not present")
+        || text.contains("empty")))
+}
+
+fn delete_yubikey_key(request: &YubiKeyRequest) -> AppResult<()> {
+    let mut args = vec!["piv", "keys", "delete", "--pin", &request.pin];
+    args.push("--management-key");
+    args.push(yubikey_management_key(request));
+    args.push(&request.slot);
+    let _ = run_ykman(&args)?;
+    Ok(())
+}
+
+fn yubikey_management_key(request: &YubiKeyRequest) -> &str {
+    request
+        .management_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(DEFAULT_YUBIKEY_MANAGEMENT_KEY)
+}
+
 impl Drop for PendingRequest {
     fn drop(&mut self) {
         if !self.accepted {
@@ -221,7 +442,9 @@ pub fn inspect_root(root: &RootConfig) -> AppResult<RootInfo> {
         )));
     }
     let fingerprint = hex::encode(Sha256::digest(parsed_pem.contents()));
-    let installed = root_is_installed(&fingerprint).unwrap_or(false);
+    let thumbprint = hex::encode(sha1::Sha1::digest(parsed_pem.contents())).to_ascii_uppercase();
+    let installed = root_is_user_installed(&thumbprint).unwrap_or(false);
+    let machine_installed = root_is_machine_installed(&thumbprint).unwrap_or(false);
     let conflicting_subject =
         subject_has_other_certificate(&cert.subject().to_string(), &fingerprint).unwrap_or(false);
     Ok(RootInfo {
@@ -232,6 +455,7 @@ pub fn inspect_root(root: &RootConfig) -> AppResult<RootInfo> {
         not_before: cert.validity().not_before.to_string(),
         not_after: cert.validity().not_after.to_string(),
         installed,
+        machine_installed,
         conflicting_subject,
         refreshable: root.refresh_path.is_some(),
     })
@@ -269,7 +493,7 @@ fn install_root_with_policy(root: &RootConfig, allow_same_subject: bool) -> AppR
             &output,
         )));
     }
-    if !root_is_installed(&info.fingerprint)? {
+    if !root_is_user_installed_by_root(root)? {
         return Err(AppError::Certificate(
             "root installation could not be verified".into(),
         ));
@@ -282,11 +506,8 @@ pub fn remove_root(root: &RootConfig) -> AppResult<()> {
     if !info.installed {
         return Ok(());
     }
-    let output = run_windows(
-        "certutil.exe",
-        &["-user", "-delstore", "Root", &info.fingerprint],
-    )?;
-    if !output.status.success() {
+    let output = remove_root_by_sha1(&root_sha1_thumbprint(root)?)?;
+    if !output.status.success() || root_is_user_installed_by_root(root)? {
         return Err(AppError::Certificate(command_error(
             "Windows did not remove the root certificate",
             &output,
@@ -295,9 +516,45 @@ pub fn remove_root(root: &RootConfig) -> AppResult<()> {
     Ok(())
 }
 
-fn root_is_installed(fingerprint: &str) -> AppResult<bool> {
-    let output = run_windows("certutil.exe", &["-user", "-store", "Root", fingerprint])?;
-    Ok(output.status.success())
+fn root_is_user_installed_by_root(root: &RootConfig) -> AppResult<bool> {
+    let thumbprint = root_sha1_thumbprint(root)?;
+    root_is_user_installed(&thumbprint)
+}
+
+fn root_sha1_thumbprint(root: &RootConfig) -> AppResult<String> {
+    let parsed_pem = ::pem::parse(&root.pem)
+        .map_err(|_| AppError::Certificate("embedded root is invalid PEM".into()))?;
+    Ok(hex::encode(sha1::Sha1::digest(parsed_pem.contents())).to_ascii_uppercase())
+}
+
+fn root_is_user_installed(thumbprint: &str) -> AppResult<bool> {
+    #[cfg(windows)]
+    {
+        let output = run_windows("certutil.exe", &["-user", "-store", "Root", thumbprint])?;
+        Ok(output.status.success())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = thumbprint;
+        Err(AppError::Certificate(
+            "this operation is only supported on Windows".into(),
+        ))
+    }
+}
+
+fn root_is_machine_installed(thumbprint: &str) -> AppResult<bool> {
+    #[cfg(windows)]
+    {
+        let output = run_windows("certutil.exe", &["-store", "Root", thumbprint])?;
+        Ok(output.status.success())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = thumbprint;
+        Err(AppError::Certificate(
+            "this operation is only supported on Windows".into(),
+        ))
+    }
 }
 
 fn subject_has_other_certificate(subject: &str, fingerprint: &str) -> AppResult<bool> {
@@ -305,18 +562,11 @@ fn subject_has_other_certificate(subject: &str, fingerprint: &str) -> AppResult<
     {
         use base64::Engine;
         let encoded = base64::engine::general_purpose::STANDARD.encode(subject.as_bytes());
-        let expected = fingerprint.to_ascii_uppercase();
-        let script = format!("$s=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{encoded}')); $f='{expected}'; if(Get-ChildItem Cert:\\CurrentUser\\Root | Where-Object {{$_.Subject -eq $s -and ($_.Thumbprint -replace ' ','') -ne $f}}){{exit 7}} else {{exit 0}}");
-        let output = run_windows(
-            "powershell.exe",
-            &[
-                "-NoLogo",
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                &script,
-            ],
-        )?;
+        let expected = fingerprint.to_ascii_lowercase();
+        let script = format!(
+            "$s=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{encoded}')); $f='{expected}'; $sha=[Security.Cryptography.SHA256]::Create(); $conflict=@(Get-ChildItem Cert:\\CurrentUser\\Root | Where-Object {{$_.Subject -eq $s -and (($sha.ComputeHash($_.RawData) | ForEach-Object {{$_.ToString('x2')}}) -join '') -ne $f}}); if($conflict.Count -gt 0){{exit 7}}else{{exit 0}}"
+        );
+        let output = run_powershell(&script)?;
         Ok(output.status.code() == Some(7))
     }
     #[cfg(not(windows))]
@@ -326,6 +576,120 @@ fn subject_has_other_certificate(subject: &str, fingerprint: &str) -> AppResult<
             "this operation is only supported on Windows".into(),
         ))
     }
+}
+
+#[cfg(windows)]
+fn remove_root_by_sha1(thumbprint: &str) -> AppResult<std::process::Output> {
+    run_windows("certutil.exe", &["-user", "-delstore", "Root", thumbprint])
+}
+
+#[cfg(windows)]
+fn run_powershell(script: &str) -> AppResult<std::process::Output> {
+    run_windows(
+        "powershell.exe",
+        &[
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            script,
+        ],
+    )
+}
+
+#[cfg(windows)]
+fn run_ykman(args: &[&str]) -> AppResult<std::process::Output> {
+    use std::os::windows::process::CommandExt;
+    use std::time::{Duration, Instant};
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+    let executable = find_ykman();
+    let ykman_data = tempfile::Builder::new()
+        .prefix("openbao-ykman-")
+        .tempdir()
+        .map_err(|_| {
+            AppError::Certificate(
+                "could not create a private YubiKey Manager work directory".into(),
+            )
+        })?;
+    let mut child = Command::new(&executable)
+        .args(args)
+        .env("XDG_DATA_HOME", ykman_data.path())
+        .env("XDG_CACHE_HOME", ykman_data.path())
+        .stdin(std::process::Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|_| {
+            AppError::Certificate(
+                "YubiKey Manager CLI (ykman) could not be started; install ykman and try again"
+                    .into(),
+            )
+        })?;
+    let started = Instant::now();
+    loop {
+        if child
+            .try_wait()
+            .map_err(|_| AppError::Certificate("YubiKey Manager failed unexpectedly".into()))?
+            .is_some()
+        {
+            return child.wait_with_output().map_err(|_| {
+                AppError::Certificate("YubiKey Manager output could not be read".into())
+            });
+        }
+        if started.elapsed() > Duration::from_secs(45) {
+            let _ = child.kill();
+            let _ = child.wait();
+            let command = redact_ykman_args(args);
+            return Err(AppError::Certificate(
+                format!("YubiKey Manager timed out while running 'ykman {command}'; if the YubiKey was waiting for touch, PIN, or overwrite confirmation, try again after clearing the target slot or choosing another slot"),
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[cfg(windows)]
+fn redact_ykman_args(args: &[&str]) -> String {
+    let mut redacted = Vec::with_capacity(args.len());
+    let mut hide_next = false;
+    for arg in args {
+        if hide_next {
+            redacted.push("<redacted>");
+            hide_next = false;
+            continue;
+        }
+        redacted.push(*arg);
+        if matches!(
+            *arg,
+            "--pin" | "-P" | "--management-key" | "-m" | "--password" | "-p"
+        ) {
+            hide_next = true;
+        }
+    }
+    redacted.join(" ")
+}
+
+#[cfg(windows)]
+fn find_ykman() -> std::path::PathBuf {
+    let default = std::path::PathBuf::from("ykman.exe");
+    if let Some(program_files) = std::env::var_os("ProgramFiles") {
+        let candidate = std::path::PathBuf::from(program_files)
+            .join("Yubico")
+            .join("YubiKey Manager CLI")
+            .join("ykman.exe");
+        if candidate.exists() {
+            return candidate;
+        }
+    }
+    default
+}
+
+#[cfg(not(windows))]
+fn run_ykman(_args: &[&str]) -> AppResult<std::process::Output> {
+    Err(AppError::Certificate(
+        "YubiKey issuance is only supported on Windows in this build".into(),
+    ))
 }
 
 fn delete_key_container(container: &str) -> AppResult<()> {
@@ -638,7 +1002,11 @@ fn path_text(path: &std::path::Path) -> AppResult<&str> {
 }
 
 fn command_error(prefix: &str, output: &std::process::Output) -> String {
-    let detail = String::from_utf8_lossy(&output.stderr);
+    let detail = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
     let safe = crate::redaction::redact(detail.trim());
     if safe.is_empty() {
         prefix.into()

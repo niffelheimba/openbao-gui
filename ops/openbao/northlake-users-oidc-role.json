@@ -1,0 +1,21 @@
+{
+  "role_type": "oidc",
+  "bound_audiences": ["openbao"],
+  "bound_claims": {},
+  "bound_claims_type": "string",
+  "user_claim": "sub",
+  "groups_claim": "groups",
+  "claim_mappings": {
+    "sub": "sub",
+    "preferred_username": "preferred_username"
+  },
+  "oidc_scopes": ["openid", "profile", "email", "groups"],
+  "allowed_redirect_uris": [
+    "https://secrets.cloud.northlake.dev/v1/auth/oidc/oidc/callback"
+  ],
+  "callback_mode": "direct",
+  "token_policies": ["northlake-users"],
+  "token_no_default_policy": true,
+  "token_ttl": 3600,
+  "token_max_ttl": 28800
+}

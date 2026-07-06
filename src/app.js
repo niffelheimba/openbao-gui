@@ -6,11 +6,14 @@ const els = {
   warning: document.querySelector("#configuration-warning"),
   message: document.querySelector("#message"),
   roots: document.querySelector("#roots"),
+  installedCertificates: document.querySelector("#installed-certificates"),
   profiles: document.querySelector("#profiles"),
+  yubikeyProfiles: document.querySelector("#yubikey-profiles"),
   sessionSummary: document.querySelector("#session-summary"),
   sessionAction: document.querySelector("#session-action"),
   deploymentName: document.querySelector("#deployment-name"),
   refreshRoots: document.querySelector("#refresh-roots"),
+  refreshCertificates: document.querySelector("#refresh-certificates"),
   serverForm: document.querySelector("#server-settings"),
   serverAddress: document.querySelector("#server-address"),
   serverNamespace: document.querySelector("#server-namespace"),
@@ -19,6 +22,12 @@ const els = {
   serverSource: document.querySelector("#server-source"),
   resetServer: document.querySelector("#reset-server"),
   checkConnection: document.querySelector("#check-connection"),
+  yubikeySlot: document.querySelector("#yubikey-slot"),
+  yubikeyAlgorithm: document.querySelector("#yubikey-algorithm"),
+  yubikeyPinPolicy: document.querySelector("#yubikey-pin-policy"),
+  yubikeyTouchPolicy: document.querySelector("#yubikey-touch-policy"),
+  yubikeyPin: document.querySelector("#yubikey-pin"),
+  yubikeyManagementKey: document.querySelector("#yubikey-management-key"),
 };
 
 let status;
@@ -61,8 +70,10 @@ async function refresh() {
     }
     renderSession();
     await refreshRoots();
+    await refreshInstalledCertificates();
     await refreshCertificateStatus();
     renderProfiles();
+    renderYubiKeyProfiles();
   } catch (error) {
     showMessage(String(error), "error");
   }
@@ -76,7 +87,8 @@ async function refreshRoots() {
         <div>
           <p><strong>${escapeHtml(root.subject)}</strong></p>
           <p class="meta">SHA-256 ${escapeHtml(root.fingerprint)}</p>
-          <p class="muted">Valid ${escapeHtml(root.notBefore)} – ${escapeHtml(root.notAfter)}</p>
+          <p class="muted">Valid ${escapeHtml(root.notBefore)} - ${escapeHtml(root.notAfter)}</p>
+          <p class="muted">${root.installed ? "Installed for this Windows user." : root.machineInstalled ? "Trusted machine-wide; this app can only remove per-user trust." : "Not installed for this Windows user."}</p>
         </div>
         <div>
           ${root.installed && root.refreshable ? `<button class="quiet" data-root-refresh="${escapeHtml(root.id)}">Check update</button>` : ""}
@@ -94,7 +106,10 @@ async function refreshRoots() {
         await invoke(installed ? "remove_root" : "install_root", { rootId: button.dataset.root });
         showMessage(installed ? "Root trust removed." : "Root certificate trusted.");
         await refreshRoots();
-      } catch (error) { showMessage(String(error), "error"); button.disabled = false; }
+      } catch (error) {
+        showMessage(String(error), "error");
+        button.disabled = false;
+      }
     }));
     document.querySelectorAll("[data-root-refresh]").forEach(button => button.addEventListener("click", async () => {
       button.disabled = true;
@@ -107,18 +122,61 @@ async function refreshRoots() {
           showMessage("Updated root certificate trusted.");
           await refreshRoots();
         }
-      } catch (error) { showMessage(String(error), "error"); }
-      finally { button.disabled = false; }
+      } catch (error) {
+        showMessage(String(error), "error");
+      } finally {
+        button.disabled = false;
+      }
     }));
-  } catch (error) { els.roots.innerHTML = `<p class="muted">${escapeHtml(error)}</p>`; }
+  } catch (error) {
+    els.roots.innerHTML = `<p class="muted">${escapeHtml(error)}</p>`;
+  }
 }
 
 function renderSession() {
   const session = status?.session;
   const expiry = session ? new Date(session.expiresAt * 1000).toLocaleString() : "";
-  els.sessionSummary.textContent = loginPending ? "Waiting for browser authentication…" : session ? `Signed in as ${session.identity}. Session expires ${expiry}.` : "Not signed in.";
+  els.sessionSummary.textContent = loginPending
+    ? "Waiting for browser authentication..."
+    : session
+      ? `Signed in as ${session.identity}. Session expires ${expiry}.`
+      : "Not signed in.";
   els.sessionAction.textContent = loginPending ? "Cancel" : session ? "Sign out" : "Sign in";
   els.sessionAction.disabled = !status?.configured;
+}
+
+function certificatePurpose(certificate) {
+  const eku = new Set(certificate.ekuOids ?? []);
+  const labels = [];
+  if (eku.has("1.3.6.1.5.5.7.3.2")) labels.push("mTLS / client authentication");
+  if (eku.has("1.3.6.1.5.5.7.3.4")) labels.push("S/MIME email protection");
+  if (eku.has("1.3.6.1.4.1.311.10.3.12")) labels.push("Office document signing");
+  if (eku.has("1.3.6.1.5.5.7.3.3")) labels.push("code signing");
+  if (!labels.length && eku.size) labels.push("Other certificate usage");
+  if (!labels.length) labels.push("No enhanced key usage listed");
+  return labels.join(" / ");
+}
+
+async function refreshInstalledCertificates() {
+  try {
+    const certificates = await invoke("list_all_personal_certificates");
+    const relevant = certificates
+      .filter(certificate => certificate.hasPrivateKey || (certificate.ekuOids ?? []).length)
+      .sort((a, b) => Date.parse(b.notAfter) - Date.parse(a.notAfter));
+    els.installedCertificates.innerHTML = relevant.length ? relevant.map(certificate => `
+      <div class="row cert-row">
+        <div>
+          <p><strong>${escapeHtml(certificate.simpleName || certificate.subject)}</strong></p>
+          <p class="muted">${escapeHtml(certificatePurpose(certificate))}${certificate.hasPrivateKey ? " / private key available" : " / no private key"}</p>
+          <p class="muted">Expires ${new Date(certificate.notAfter).toLocaleString()}</p>
+          ${certificate.emailNames?.length ? `<p class="muted">Email ${escapeHtml(certificate.emailNames.join(", "))}</p>` : ""}
+          ${certificate.dnsNames?.length ? `<p class="muted">DNS ${escapeHtml(certificate.dnsNames.join(", "))}</p>` : ""}
+          <p class="meta">Thumbprint ${escapeHtml(certificate.thumbprint)}</p>
+        </div>
+      </div>`).join("") : '<p class="muted">No client/signing/email certificates were found in CurrentUser\\My.</p>';
+  } catch (error) {
+    els.installedCertificates.innerHTML = `<p class="muted">${escapeHtml(error)}</p>`;
+  }
 }
 
 function renderProfiles() {
@@ -131,11 +189,15 @@ function renderProfiles() {
     const installed = certificateStatuses.get(profile.id) ?? [];
     const latest = [...installed].sort((a, b) => Date.parse(b.notAfter) - Date.parse(a.notAfter))[0];
     const detail = latest
-      ? `Installed · expires ${new Date(latest.notAfter).toLocaleString()}${installed.length > 1 ? ` · ${installed.length} matching` : ""}`
+      ? `Installed / expires ${new Date(latest.notAfter).toLocaleString()}${installed.length > 1 ? ` / ${installed.length} matching` : ""}`
       : profile.description;
     return `
-    <div class="row">
-      <div><p><strong>${escapeHtml(profile.label)}</strong></p><p class="muted">${escapeHtml(detail)}</p></div>
+    <div class="row request-row">
+      <div>
+        <p><strong>${escapeHtml(profile.label)}</strong></p>
+        <p class="muted">${escapeHtml(detail)}</p>
+        <p class="muted">Windows native / key generated in Microsoft Software Key Storage Provider.</p>
+      </div>
       <button data-profile="${escapeHtml(profile.id)}" data-replace="${installed.length > 0}" ${status.session ? "" : "disabled"}>${installed.length ? "Replace" : "Request"}</button>
     </div>`;
   }).join("");
@@ -143,18 +205,74 @@ function renderProfiles() {
     const replacing = button.dataset.replace === "true";
     const prompt = replacing
       ? "A matching certificate is already installed. Generate and install a replacement? The old certificate will remain until you verify the new one."
-      : "Generate a non-exportable key and request this certificate?";
+      : "Generate a non-exportable Windows key and request this certificate?";
     if (!confirm(prompt)) return;
     button.disabled = true;
-    showMessage("Generating a Windows key and requesting the certificate…");
+    showMessage("Generating a Windows key and requesting the certificate...");
     try {
       const result = await invoke("issue_certificate", { profileId: button.dataset.profile, replaceExisting: replacing });
       const warning = result.warnings?.length ? ` ${result.warnings.join(" ")}` : "";
       showMessage(`Installed certificate ${result.thumbprint}; expires ${result.notAfter}.${warning}`);
+      await refreshInstalledCertificates();
       await refreshCertificateStatus();
       renderProfiles();
-    } catch (error) { showMessage(String(error), "error"); }
-    finally { button.disabled = false; }
+    } catch (error) {
+      showMessage(String(error), "error");
+    } finally {
+      button.disabled = false;
+    }
+  }));
+}
+
+function renderYubiKeyProfiles() {
+  const profiles = status?.profiles ?? [];
+  if (!profiles.length) {
+    els.yubikeyProfiles.innerHTML = '<p class="muted">No certificate profiles are configured.</p>';
+    return;
+  }
+  els.yubikeyProfiles.innerHTML = profiles.map(profile => `
+    <div class="row request-row">
+      <div>
+        <p><strong>${escapeHtml(profile.label)}</strong></p>
+        <p class="muted">YubiKey-backed ${escapeHtml(profile.purpose)} certificate for web or desktop app client authentication.</p>
+        <p class="muted">Requires YubiKey Manager CLI (ykman). The private key is generated on the YubiKey PIV slot.</p>
+      </div>
+      <button data-yubikey-profile="${escapeHtml(profile.id)}" ${status.session ? "" : "disabled"}>Request on YubiKey</button>
+    </div>`).join("");
+  document.querySelectorAll("[data-yubikey-profile]").forEach(button => button.addEventListener("click", async () => {
+    if (!els.yubikeyPin.value) {
+      showMessage("Enter the YubiKey PIV PIN before requesting a YubiKey certificate.", "error");
+      els.yubikeyPin.focus();
+      return;
+    }
+    const slot = els.yubikeySlot.value;
+    const profileId = button.dataset.yubikeyProfile;
+    if (!confirm(`Generate a new key on YubiKey PIV slot ${slot} and request this certificate?\n\nThis build will not overwrite an existing YubiKey key or certificate. If the slot is occupied, choose another slot or clear it with YubiKey Manager first.`)) return;
+    button.disabled = true;
+    showMessage("Generating a YubiKey key and requesting the certificate. Touch the YubiKey if prompted...");
+    try {
+      const result = await invoke("issue_yubikey_certificate", {
+        request: {
+          profileId,
+          slot,
+          pin: els.yubikeyPin.value,
+          managementKey: els.yubikeyManagementKey.value || null,
+          algorithm: els.yubikeyAlgorithm.value,
+          pinPolicy: els.yubikeyPinPolicy.value,
+          touchPolicy: els.yubikeyTouchPolicy.value,
+          replaceExisting: false,
+        }
+      });
+      const warning = result.warnings?.length ? ` ${result.warnings.join(" ")}` : "";
+      showMessage(`Imported YubiKey certificate ${result.thumbprint}; expires ${result.notAfter}.${warning}`);
+      els.yubikeyPin.value = "";
+      els.yubikeyManagementKey.value = "";
+      await refreshInstalledCertificates();
+    } catch (error) {
+      showMessage(String(error), "error");
+    } finally {
+      button.disabled = false;
+    }
   }));
 }
 
@@ -171,15 +289,25 @@ async function refreshCertificateStatus() {
 
 els.sessionAction.addEventListener("click", async () => {
   if (loginPending) {
-    try { await invoke("cancel_login"); }
-    catch (error) { showMessage(String(error), "error"); }
-    finally { loginPending = false; renderSession(); }
+    try {
+      await invoke("cancel_login");
+    } catch (error) {
+      showMessage(String(error), "error");
+    } finally {
+      loginPending = false;
+      renderSession();
+    }
     return;
   }
   if (status.session) {
-    try { await invoke("logout"); showMessage("Signed out."); }
-    catch (error) { showMessage(`The local session was cleared, but OpenBao revocation failed: ${error}`, "error"); }
-    finally { await refresh(); }
+    try {
+      await invoke("logout");
+      showMessage("Signed out.");
+    } catch (error) {
+      showMessage(`The local session was cleared, but OpenBao revocation failed: ${error}`, "error");
+    } finally {
+      await refresh();
+    }
     return;
   }
   loginPending = true;
@@ -188,42 +316,58 @@ els.sessionAction.addEventListener("click", async () => {
   try {
     await invoke("login");
     showMessage("Authentication complete.");
-  } catch (error) { showMessage(String(error), "error"); }
-  finally { loginPending = false; await refresh(); }
+  } catch (error) {
+    showMessage(String(error), "error");
+  } finally {
+    loginPending = false;
+    await refresh();
+  }
 });
 
 els.refreshRoots.addEventListener("click", refreshRoots);
+els.refreshCertificates.addEventListener("click", refreshInstalledCertificates);
 els.checkConnection.addEventListener("click", async () => {
   els.checkConnection.disabled = true;
-  showMessage("Checking OpenBao over Windows-trusted HTTPS…");
+  showMessage("Checking OpenBao over Windows-trusted HTTPS...");
   try {
     const health = await invoke("check_openbao_connection");
-    showMessage(`OpenBao connection trusted. Server version ${health.version}.`);
+    showMessage(health.version
+      ? `OpenBao connection trusted. Server version ${health.version}.`
+      : "OpenBao connection trusted. Server did not report a version.");
   } catch (error) {
     showMessage(String(error), "error");
   } finally {
     els.checkConnection.disabled = false;
   }
 });
+
 els.serverForm.addEventListener("submit", async event => {
   event.preventDefault();
   try {
-    await invoke("save_server_settings", { settings: {
-      schemaVersion: 1,
-      address: els.serverAddress.value.trim(),
-      namespace: els.serverNamespace.value.trim() || null,
-      authMount: els.authMount.value.trim(),
-      oidcRole: els.oidcRole.value.trim(),
-    }});
+    await invoke("save_server_settings", {
+      settings: {
+        schemaVersion: 1,
+        address: els.serverAddress.value.trim(),
+        namespace: els.serverNamespace.value.trim() || null,
+        authMount: els.authMount.value.trim(),
+        oidcRole: els.oidcRole.value.trim(),
+      }
+    });
     showMessage("Server settings saved. Exit from the tray and reopen the application to apply them.");
-  } catch (error) { showMessage(String(error), "error"); }
+  } catch (error) {
+    showMessage(String(error), "error");
+  }
 });
+
 els.resetServer.addEventListener("click", async () => {
   if (!confirm("Remove the per-user server override and return to the server embedded by your administrator?")) return;
   try {
     await invoke("reset_server_settings");
     showMessage("Server override removed. Exit from the tray and reopen the application to apply the embedded defaults.");
-  } catch (error) { showMessage(String(error), "error"); }
+  } catch (error) {
+    showMessage(String(error), "error");
+  }
 });
+
 listen("session-changed", refresh);
 refresh();

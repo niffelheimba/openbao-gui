@@ -1,18 +1,41 @@
 {
-  "schema_version": 1,
-  "configured": false,
-  "deployment_name": "Unconfigured homelab",
-  "openbao": {
-    "address": "https://openbao.example.invalid:8200",
-    "namespace": null,
-    "auth_mount": "oidc",
-    "oidc_role": "desktop-certificates",
-    "minimum_version": "2.5.5"
-  },
-  "identity": {
-    "display_claim": "preferred_username",
-    "subject_claim": "email"
-  },
-  "roots": [],
-  "profiles": []
+    "schema_version":  1,
+    "configured":  true,
+    "deployment_name":  "Northlake",
+    "openbao":  {
+                    "address":  "https://secrets.cloud.northlake.dev",
+                    "namespace":  null,
+                    "auth_mount":  "oidc",
+                    "oidc_role":  "northlake-users",
+                    "minimum_version":  "2.5.5"
+                },
+    "identity":  {
+                     "display_claim":  "preferred_username",
+                     "subject_claim":  "sub"
+                 },
+    "roots":  [
+                  {
+                      "id":  "northlake-root",
+                      "pem":  "-----BEGIN CERTIFICATE-----\nMIIFqDCCA5CgAwIBAgIUa+krpYfehM47sh2zcGmu0Cnu7cAwDQYJKoZIhvcNAQEM\nBQAwWjELMAkGA1UEBhMCVVMxEjAQBgNVBAoMCU5vcnRobGFrZTEWMBQGA1UECwwN\nTm9ydGhsYWtlIFBLSTEfMB0GA1UEAwwWTm9ydGhsYWtlIFJvb3QgQ0EgMjAyNjAe\nFw0yNjA2MjUyMjM3MTVaFw00MTA2MjEyMjM3MTVaMFoxCzAJBgNVBAYTAlVTMRIw\nEAYDVQQKDAlOb3J0aGxha2UxFjAUBgNVBAsMDU5vcnRobGFrZSBQS0kxHzAdBgNV\nBAMMFk5vcnRobGFrZSBSb290IENBIDIwMjYwggIiMA0GCSqGSIb3DQEBAQUAA4IC\nDwAwggIKAoICAQDYegfbrHSLxs9Db2WsRc5Bus+PNeGSEcLqX39BecKqzkBnyy5l\nvmU5rfeL9iefB5lBccmP0ZTXSMI2EsOim46SI/lh/D+RxzZdCgw3rKtvRSMBYFO5\nKjBG6L3wC7MnZiSaL6ZTEKEmOpFUoHhcfUrbpKt4LlGTXsrSzSHv8Q2RbxDLZEW8\nr97mwj4IUVbM+u+Iorwdziw4iozTcx1miXcdtS+gtwBbiRf9l2XLFjEkPuWn6ofq\neyqjBzoPWKmAroCuw5BgOGdHaMzZcezDQr4xtbc8LGoxmJugKGq57V0lqJWkZP0q\nGK/NHtEoL0b/UWiPpDMMR3fPJEr4tIFRc95FsKgRSV9rSFVRrO6nagQUHUGlGbAd\nIrI8uaV3mIE4GfX8jQFG1PM8wNc4vv2YmvghgxC8NLnlyT/FptbFpAyIh13ae/55\n5bpK3aF3RA3mUF0oOa8S9eHXS4nTnCbhl6oj2j4dKr/vxcIfMfedVrygjnqGnFXn\ndme6CKAX0x7NTiuMm5l5y9qAyUZDyKhKOCvox17N8DWTf6xk+MYkEWfrnLyaZVfY\nfD4Q/cFLwmt/yT0PvUP1/3V/yK8rLMKeU0GMVgC9BZZKsN0oxKUwyjirpDa/f/7v\nk8j458MG+Xuu1HvjxvWmfhRvTSWgv6urmt4RBGQnkmZ5G1/iZuZUOaG1ZwIDAQAB\no2YwZDAdBgNVHQ4EFgQUvBioREuy/pFKHT0js7mC0a400vwwHwYDVR0jBBgwFoAU\nvBioREuy/pFKHT0js7mC0a400vwwEgYDVR0TAQH/BAgwBgEB/wIBATAOBgNVHQ8B\nAf8EBAMCAQYwDQYJKoZIhvcNAQEMBQADggIBAFr8WfNj3vzDHO88dMil8ox+5IXW\nF3/Dt4PV97IhdmTqp5ihOs5VOQum0eW+RwDP521SPg8vseth0RGlsnhG7Le71idd\nxShMmRbXidlu9dinv1LpYSpqmLSXJnxvWy8RItHTNrIeLgDk1X6/yrt8N2G70VI+\n+5wZCB52l3XAAYcEszcVUgd/836q/M+FHk7ZkBEYwZgZkauiGF5DVlAFospRNnpO\nf4WPLmVWMRHf23ZApXVxO3DEyBeUVveMTqyEx/BJsbIfHCq2uCeX5xitFAI5/J70\nXU/t66iSgEotJ9jnTQPB9GuNkoLmcX9T8WcgvJmnXpLSCfZwN793w7X4/aiN5HuV\n8jl/5tI0GoV34nyOW+IzkQ4pa8NExXmLgE/6B3zXY3hEF+72Owbhi6VdnnG6/G1z\nx+5UBzmcbsXC4PfyoOoc02FWjZRnT4wNwHS46BW/vBUJ6UL9pgN9u2AFJeozXGxe\nWjLt1AocIoiF2SiqhkVxqg1h/NIlrgkzDrjGCZk4DVQhYBF5Vib+xw55pimDSoew\nvedGmzNVsZssyK1UjPlwYPhLeTHauS2xiNQZHwuZdTVSMvBkIgJl22yAdYfpPEhW\nN63TNsXezGDG36ts7+Gn5m5e4XfqXgJ0LJS9wjEKA27UKMiTqr9H8JUWdHd3pjj0\nZ6HsoZ26ETBWhDzr\n-----END CERTIFICATE-----\n",
+                      "sha256":  "495cefe42a8452ff41fd56a49736335c67a0a885f69601c482163552d3713b87",
+                      "refresh_path":  null
+                  }
+              ],
+    "profiles":  [
+                     {
+                         "id":  "user-mtls",
+                         "label":  "User mTLS",
+                         "description":  "Client authentication for homelab services",
+                         "purpose":  "mtls",
+                         "pki_mount":  "pki_intermediate",
+                         "pki_role":  "northlake-users",
+                         "subject_claim":  "preferred_username",
+                         "san_claim":  null,
+                         "destination_store":  "My",
+                         "key_algorithm":  "rsa-3072",
+                         "expected_eku_oids":  [
+                                                   "1.3.6.1.5.5.7.3.2"
+                                               ]
+                     }
+                 ]
 }

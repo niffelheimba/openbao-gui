@@ -79,14 +79,79 @@
         </div>
       </section>
 
-      <section class="card">
+      <section class="card inventory-card">
         <div class="section-heading">
           <div>
-            <h2>Available certificates</h2>
-            <p>Private keys stay non-exportable in your Windows user profile.</p>
+            <h2>Installed certificates</h2>
+            <p>Client, document-signing, code-signing, and S/MIME certificates currently visible in your Windows user profile.</p>
+          </div>
+          <button id="refresh-certificates" class="quiet">Refresh</button>
+        </div>
+        <div id="installed-certificates" class="stack"><p class="muted">Loading…</p></div>
+      </section>
+
+      <section class="card request-card windows-request">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">WINDOWS NATIVE</p>
+            <h2>Request Windows certificate</h2>
+            <p>Generates a non-exportable Windows CNG key and installs the signed certificate into CurrentUser\My.</p>
           </div>
         </div>
         <div id="profiles" class="stack"><p class="muted">Sign in to continue.</p></div>
+      </section>
+
+      <section class="card request-card yubikey-request">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">YUBIKEY</p>
+            <h2>Request YubiKey certificate</h2>
+            <p>For hardware-backed mTLS certificates. Requires YubiKey Manager CLI <span class="meta-inline">(ykman)</span> to be installed and a YubiKey with PIV enabled.</p>
+          </div>
+        </div>
+        <div class="settings-grid yubikey-settings">
+          <label>PIV slot
+            <select id="yubikey-slot">
+              <option value="9a">9a - Authentication</option>
+              <option value="9c">9c - Digital signature</option>
+              <option value="9d">9d - Key management</option>
+              <option value="9e">9e - Card authentication</option>
+            </select>
+          </label>
+          <label>Key algorithm
+            <select id="yubikey-algorithm">
+              <option value="rsa2048">RSA 2048</option>
+              <option value="rsa3072">RSA 3072</option>
+              <option value="rsa4096">RSA 4096</option>
+              <option value="eccp256">ECC P-256</option>
+              <option value="eccp384">ECC P-384</option>
+            </select>
+          </label>
+          <label>PIN policy
+            <select id="yubikey-pin-policy">
+              <option value="once">Once</option>
+              <option value="always">Always</option>
+              <option value="default">Default</option>
+              <option value="never">Never</option>
+            </select>
+          </label>
+          <label>Touch policy
+            <select id="yubikey-touch-policy">
+              <option value="cached">Cached</option>
+              <option value="always">Always</option>
+              <option value="default">Default</option>
+              <option value="never">Never</option>
+            </select>
+          </label>
+          <label>PIV PIN
+            <input id="yubikey-pin" type="password" autocomplete="off" placeholder="Required for this request" />
+          </label>
+          <label>Management key <span class="muted">(optional)</span>
+            <input id="yubikey-management-key" type="password" autocomplete="off" placeholder="Blank uses the default YubiKey PIV key" />
+          </label>
+          <p class="wide muted settings-note">The PIN and management key are used only for this request and are not saved. If the management key field is blank, the app supplies the standard default YubiKey PIV management key so ykman will not prompt invisibly.</p>
+        </div>
+        <div id="yubikey-profiles" class="stack"><p class="muted">YubiKey issuance is planned but not implemented in this build.</p></div>
       </section>
 
       <footer>
