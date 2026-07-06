@@ -588,17 +588,20 @@ async fn issue_yubikey_certificate(
     let csr_profile = profile.clone();
     let csr_identity = identity.clone();
     let replace_existing = request.replace_existing;
-    let (csr_pem, directory, yubikey_request) = tokio::task::spawn_blocking(move || {
-        certificates::generate_yubikey_csr(
-            &csr_profile,
-            &csr_identity,
-            &yubikey_request,
-            replace_existing,
-        )
-        .map(|(csr, directory)| (csr, directory, yubikey_request))
-    })
-    .await
-    .map_err(|_| AppError::Internal)??;
+    let (csr_pem, directory, generated_new_key, yubikey_request) =
+        tokio::task::spawn_blocking(move || {
+            certificates::generate_yubikey_csr(
+                &csr_profile,
+                &csr_identity,
+                &yubikey_request,
+                replace_existing,
+            )
+            .map(|(csr, directory, generated_new_key)| {
+                (csr, directory, generated_new_key, yubikey_request)
+            })
+        })
+        .await
+        .map_err(|_| AppError::Internal)??;
 
     let sign_request = PkiSignRequest {
         csr: &csr_pem,
@@ -648,10 +651,34 @@ async fn issue_yubikey_certificate(
                 expected_purpose: &expected_purpose,
                 expected_eku_oids: &expected_ekus,
             },
+            generated_new_key,
         )
     })
     .await
     .map_err(|_| AppError::Internal)?
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RemoveYubiKeyCertificateRequest {
+    slot: String,
+    pin: String,
+    management_key: Option<String>,
+}
+
+#[tauri::command]
+async fn remove_yubikey_certificate(request: RemoveYubiKeyCertificateRequest) -> AppResult<()> {
+    let yubikey_request = YubiKeyRequest {
+        slot: request.slot,
+        pin: request.pin,
+        management_key: request.management_key,
+        algorithm: "rsa2048".into(),
+        pin_policy: "once".into(),
+        touch_policy: "cached".into(),
+    };
+    tokio::task::spawn_blocking(move || certificates::delete_yubikey_certificate(&yubikey_request))
+        .await
+        .map_err(|_| AppError::Internal)?
 }
 
 #[tauri::command]
@@ -696,6 +723,13 @@ async fn list_certificate_status(
 #[tauri::command]
 async fn list_all_personal_certificates() -> AppResult<Vec<certificates::PersonalCertificate>> {
     tokio::task::spawn_blocking(certificates::list_personal_certificates)
+        .await
+        .map_err(|_| AppError::Internal)?
+}
+
+#[tauri::command]
+async fn remove_personal_certificate(thumbprint: String) -> AppResult<()> {
+    tokio::task::spawn_blocking(move || certificates::remove_personal_certificate(&thumbprint))
         .await
         .map_err(|_| AppError::Internal)?
 }
@@ -814,7 +848,9 @@ pub fn run() {
             cancel_login,
             logout,
             list_all_personal_certificates,
+            remove_personal_certificate,
             list_yubikey_certificates,
+            remove_yubikey_certificate,
             list_certificate_status,
             issue_yubikey_certificate,
             issue_certificate

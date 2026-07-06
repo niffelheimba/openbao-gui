@@ -75,6 +75,11 @@ embedded deployment remains unconfigured or contains placeholder trust material.
   back to an embedded root before Windows accepts a certificate
 - Current User certificate inventory with expiry display and explicit replacement
   confirmation
+- YubiKey PIV-backed mTLS issuance through an installed `ykman`, including slot
+  inventory, expired-certificate removal, and renewal using an existing hardware
+  key
+- Local loopback mTLS test-site scripts for checking whether Windows/browser TLS
+  can present the issued client certificate
 - CI tests, dependency audit, SBOM/checksum jobs, and operator documentation
 
 Production Kanidm OIDC, clean-VM installation, Office signing, SignTool, and
@@ -88,6 +93,20 @@ without using the production deployment file. It covers direct OIDC polling,
 replay and cross-identity denial, Windows trust/leaf enrollment, CNG
 non-exportability, and an actual loopback mTLS handshake.
 
-YubiKey support is intentionally planned after the software-key v1 release. The
-current client does not bundle YubiKey Manager, does not write PIV slots, and
-does not import certificates onto hardware tokens yet.
+YubiKey support does not bundle YubiKey Manager. Install `ykman` separately; the
+client uses it to generate PIV keys, create CSRs, import signed certificates, and
+inspect/remove certificates from common PIV slots.
+
+For a quick browser/client-certificate smoke test, start the local mTLS site:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File ./scripts/Start-MtlsTestSite.ps1
+```
+
+Open the reported `https://localhost:<port>/` URL and choose the issued mTLS
+certificate when Windows asks. Stop and clean up the temporary localhost trust
+certificate afterward:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File ./scripts/Stop-MtlsTestSite.ps1
+```

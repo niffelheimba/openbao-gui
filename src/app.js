@@ -165,23 +165,83 @@ function formatCertificateDate(value) {
   return Number.isNaN(parsed) ? value : new Date(parsed).toLocaleString();
 }
 
+function isExpired(certificate) {
+  const parsed = Date.parse(certificate.notAfter);
+  return !Number.isNaN(parsed) && parsed <= Date.now();
+}
+
+function profileExpectedEkus(profile) {
+  return profile.expected_eku_oids ?? profile.expectedEkuOids ?? [];
+}
+
+function certificateMatchesIdentity(certificate, identity) {
+  if (!identity) return true;
+  const lowered = identity.toLowerCase();
+  return (certificate.simpleName ?? "").toLowerCase() === lowered
+    || (certificate.subject ?? "").split(",").some(part => part.trim().toLowerCase() === `cn=${lowered}`)
+    || (certificate.dnsNames ?? []).some(value => value.toLowerCase() === lowered)
+    || (certificate.emailNames ?? []).some(value => value.toLowerCase() === lowered);
+}
+
+function matchingConfiguredProfiles(certificate) {
+  const profiles = status?.profiles ?? [];
+  const identity = status?.session?.identity ?? "";
+  return profiles.filter(profile => {
+    const expected = profileExpectedEkus(profile);
+    const hasEkus = expected.every(oid => (certificate.ekuOids ?? []).includes(oid));
+    return hasEkus && certificateMatchesIdentity(certificate, identity);
+  });
+}
+
+function configuredProfileLabel(certificate) {
+  const matches = matchingConfiguredProfiles(certificate);
+  if (!matches.length) return "";
+  const labels = matches.map(profile => profile.label).join(", ");
+  const server = status?.serverSettings?.address ?? "the configured OpenBao server";
+  return status?.session
+    ? `Matches configured OpenBao profile${matches.length > 1 ? "s" : ""} on ${server}: ${labels}`
+    : `Matches configured OpenBao profile EKU${matches.length > 1 ? "s" : ""} on ${server}: ${labels}. Sign in to verify identity.`;
+}
+
 async function refreshInstalledCertificates() {
   try {
     const certificates = await invoke("list_all_personal_certificates");
     const relevant = certificates
       .filter(certificate => certificate.hasPrivateKey || (certificate.ekuOids ?? []).length)
       .sort((a, b) => Date.parse(b.notAfter) - Date.parse(a.notAfter));
-    els.installedCertificates.innerHTML = relevant.length ? relevant.map(certificate => `
+    els.installedCertificates.innerHTML = relevant.length ? relevant.map(certificate => {
+      const managed = configuredProfileLabel(certificate);
+      const expired = isExpired(certificate);
+      return `
       <div class="row cert-row">
         <div>
           <p><strong>${escapeHtml(certificate.simpleName || certificate.subject)}</strong></p>
           <p class="muted">${escapeHtml(certificatePurpose(certificate))}${certificate.hasPrivateKey ? " / private key available" : " / no private key"}</p>
-          <p class="muted">Expires ${escapeHtml(formatCertificateDate(certificate.notAfter))}</p>
+          <p class="muted">${expired ? "Expired" : "Expires"} ${escapeHtml(formatCertificateDate(certificate.notAfter))}</p>
+          <p class="muted">Issuer ${escapeHtml(certificate.issuer)}</p>
+          ${managed ? `<p class="managed-note">${escapeHtml(managed)}</p>` : ""}
           ${certificate.emailNames?.length ? `<p class="muted">Email ${escapeHtml(certificate.emailNames.join(", "))}</p>` : ""}
           ${certificate.dnsNames?.length ? `<p class="muted">DNS ${escapeHtml(certificate.dnsNames.join(", "))}</p>` : ""}
           <p class="meta">Thumbprint ${escapeHtml(certificate.thumbprint)}</p>
         </div>
-      </div>`).join("") : '<p class="muted">No client/signing/email certificates were found in CurrentUser\\My.</p>';
+        ${expired ? `<button class="danger" data-remove-cert="${escapeHtml(certificate.thumbprint)}">Remove expired</button>` : ""}
+      </div>`;
+    }).join("") : '<p class="muted">No client/signing/email certificates were found in CurrentUser\\My.</p>';
+    document.querySelectorAll("[data-remove-cert]").forEach(button => button.addEventListener("click", async () => {
+      if (!confirm("Remove this expired certificate from CurrentUser\\My?")) return;
+      button.disabled = true;
+      try {
+        await invoke("remove_personal_certificate", { thumbprint: button.dataset.removeCert });
+        showMessage("Expired Windows certificate removed.");
+        await refreshInstalledCertificates();
+        await refreshCertificateStatus();
+        renderProfiles();
+      } catch (error) {
+        showMessage(String(error), "error");
+      } finally {
+        button.disabled = false;
+      }
+    }));
   } catch (error) {
     els.installedCertificates.innerHTML = `<p class="muted">${escapeHtml(error)}</p>`;
   }
@@ -192,6 +252,9 @@ async function refreshYubiKeyCertificates() {
     const slots = await invoke("list_yubikey_certificates");
     els.yubikeyCertificates.innerHTML = slots.length ? slots.map(slot => {
       const certificate = slot.certificate;
+      const managed = certificate ? configuredProfileLabel(certificate) : "";
+      const expired = certificate ? isExpired(certificate) : false;
+      const matches = certificate ? matchingConfiguredProfiles(certificate) : [];
       const statusText = certificate
         ? `${certificatePurpose(certificate)} / ${slot.hasPrivateKey ? "hardware private key present" : "certificate only"}`
         : slot.hasPrivateKey
@@ -204,14 +267,47 @@ async function refreshYubiKeyCertificates() {
           <p class="muted">${escapeHtml(statusText)}</p>
           ${certificate ? `
             <p class="muted">${escapeHtml(certificate.simpleName || certificate.subject)}</p>
-            <p class="muted">Expires ${escapeHtml(formatCertificateDate(certificate.notAfter))}</p>
+            <p class="muted">${expired ? "Expired" : "Expires"} ${escapeHtml(formatCertificateDate(certificate.notAfter))}</p>
+            <p class="muted">Issuer ${escapeHtml(certificate.issuer)}</p>
+            ${managed ? `<p class="managed-note">${escapeHtml(managed)}</p>` : ""}
             ${certificate.emailNames?.length ? `<p class="muted">Email ${escapeHtml(certificate.emailNames.join(", "))}</p>` : ""}
             ${certificate.dnsNames?.length ? `<p class="muted">DNS ${escapeHtml(certificate.dnsNames.join(", "))}</p>` : ""}
             <p class="meta">Thumbprint ${escapeHtml(certificate.thumbprint)}</p>
           ` : ""}
         </div>
+        ${expired ? `<div class="button-column">
+          ${matches[0] ? `<button data-yubikey-rerequest="${escapeHtml(matches[0].id)}" data-yubikey-slot-renew="${escapeHtml(slot.slot)}" ${status?.session ? "" : "disabled"}>Re-request</button>` : ""}
+          <button class="danger" data-remove-yubikey-cert="${escapeHtml(slot.slot)}">Remove expired</button>
+        </div>` : ""}
       </div>`;
     }).join("") : '<p class="muted">No YubiKey PIV slots were reported.</p>';
+    document.querySelectorAll("[data-yubikey-rerequest]").forEach(button => button.addEventListener("click", async () => {
+      await requestYubiKeyCertificate(button.dataset.yubikeyRerequest, button.dataset.yubikeySlotRenew, true, button);
+    }));
+    document.querySelectorAll("[data-remove-yubikey-cert]").forEach(button => button.addEventListener("click", async () => {
+      if (!els.yubikeyPin.value) {
+        showMessage("Enter the YubiKey PIV PIN before removing a YubiKey certificate.", "error");
+        els.yubikeyPin.focus();
+        return;
+      }
+      if (!confirm(`Remove the expired certificate from YubiKey PIV slot ${button.dataset.removeYubikeyCert}? The private key remains on the YubiKey.`)) return;
+      button.disabled = true;
+      try {
+        await invoke("remove_yubikey_certificate", {
+          request: {
+            slot: button.dataset.removeYubikeyCert,
+            pin: els.yubikeyPin.value,
+            managementKey: els.yubikeyManagementKey.value || null,
+          }
+        });
+        showMessage("Expired YubiKey certificate removed. The private key remains in the slot.");
+        await refreshYubiKeyCertificates();
+      } catch (error) {
+        showMessage(String(error), "error");
+      } finally {
+        button.disabled = false;
+      }
+    }));
   } catch (error) {
     els.yubikeyCertificates.innerHTML = `<p class="muted">${escapeHtml(error)}</p>`;
   }
@@ -226,8 +322,9 @@ function renderProfiles() {
   els.profiles.innerHTML = profiles.map(profile => {
     const installed = certificateStatuses.get(profile.id) ?? [];
     const latest = [...installed].sort((a, b) => Date.parse(b.notAfter) - Date.parse(a.notAfter))[0];
+    const latestExpired = latest ? isExpired(latest) : false;
     const detail = latest
-      ? `Installed / expires ${new Date(latest.notAfter).toLocaleString()}${installed.length > 1 ? ` / ${installed.length} matching` : ""}`
+      ? `${latestExpired ? "Expired" : "Installed"} / ${formatCertificateDate(latest.notAfter)}${installed.length > 1 ? ` / ${installed.length} matching` : ""}`
       : profile.description;
     return `
     <div class="row request-row">
@@ -236,7 +333,7 @@ function renderProfiles() {
         <p class="muted">${escapeHtml(detail)}</p>
         <p class="muted">Windows native / key generated in Microsoft Software Key Storage Provider.</p>
       </div>
-      <button data-profile="${escapeHtml(profile.id)}" data-replace="${installed.length > 0}" ${status.session ? "" : "disabled"}>${installed.length ? "Replace" : "Request"}</button>
+      <button data-profile="${escapeHtml(profile.id)}" data-replace="${installed.length > 0}" ${status.session ? "" : "disabled"}>${latestExpired ? "Re-request expired" : installed.length ? "Replace" : "Request"}</button>
     </div>`;
   }).join("");
   document.querySelectorAll("[data-profile]").forEach(button => button.addEventListener("click", async () => {
@@ -278,41 +375,46 @@ function renderYubiKeyProfiles() {
       <button data-yubikey-profile="${escapeHtml(profile.id)}" ${status.session ? "" : "disabled"}>Request on YubiKey</button>
     </div>`).join("");
   document.querySelectorAll("[data-yubikey-profile]").forEach(button => button.addEventListener("click", async () => {
-    if (!els.yubikeyPin.value) {
-      showMessage("Enter the YubiKey PIV PIN before requesting a YubiKey certificate.", "error");
-      els.yubikeyPin.focus();
-      return;
-    }
-    const slot = els.yubikeySlot.value;
-    const profileId = button.dataset.yubikeyProfile;
-    if (!confirm(`Generate a new key on YubiKey PIV slot ${slot} and request this certificate?\n\nThis build will not overwrite an existing YubiKey key or certificate. If the slot is occupied, choose another slot or clear it with YubiKey Manager first.`)) return;
-    button.disabled = true;
-    showMessage("YubiKey request running. If the YubiKey starts blinking, touch its metal contact now; there may not be a separate Windows prompt.", "warning");
-    try {
-      const result = await invoke("issue_yubikey_certificate", {
-        request: {
-          profileId,
-          slot,
-          pin: els.yubikeyPin.value,
-          managementKey: els.yubikeyManagementKey.value || null,
-          algorithm: els.yubikeyAlgorithm.value,
-          pinPolicy: els.yubikeyPinPolicy.value,
-          touchPolicy: els.yubikeyTouchPolicy.value,
-          replaceExisting: false,
-        }
-      });
-      const warning = result.warnings?.length ? ` ${result.warnings.join(" ")}` : "";
-      showMessage(`Imported YubiKey certificate ${result.thumbprint}; expires ${result.notAfter}.${warning}`);
-      els.yubikeyPin.value = "";
-      els.yubikeyManagementKey.value = "";
-      await refreshInstalledCertificates();
-      await refreshYubiKeyCertificates();
-    } catch (error) {
-      showMessage(String(error), "error");
-    } finally {
-      button.disabled = false;
-    }
+    await requestYubiKeyCertificate(button.dataset.yubikeyProfile, els.yubikeySlot.value, false, button);
   }));
+}
+
+async function requestYubiKeyCertificate(profileId, slot, replaceExisting, button) {
+  if (!els.yubikeyPin.value) {
+    showMessage("Enter the YubiKey PIV PIN before requesting a YubiKey certificate.", "error");
+    els.yubikeyPin.focus();
+    return;
+  }
+  const prompt = replaceExisting
+    ? `Re-request this certificate using the existing key on YubiKey PIV slot ${slot}?`
+    : `Generate a new key on YubiKey PIV slot ${slot} and request this certificate?\n\nThis build will not overwrite an existing YubiKey key or certificate unless you use Re-request for an expired YubiKey certificate.`;
+  if (!confirm(prompt)) return;
+  button.disabled = true;
+  showMessage("YubiKey request running. If the YubiKey starts blinking, touch its metal contact now; there may not be a separate Windows prompt.", "warning");
+  try {
+    const result = await invoke("issue_yubikey_certificate", {
+      request: {
+        profileId,
+        slot,
+        pin: els.yubikeyPin.value,
+        managementKey: els.yubikeyManagementKey.value || null,
+        algorithm: els.yubikeyAlgorithm.value,
+        pinPolicy: els.yubikeyPinPolicy.value,
+        touchPolicy: els.yubikeyTouchPolicy.value,
+        replaceExisting,
+      }
+    });
+    const warning = result.warnings?.length ? ` ${result.warnings.join(" ")}` : "";
+    showMessage(`Imported YubiKey certificate ${result.thumbprint}; expires ${result.notAfter}.${warning}`);
+    els.yubikeyPin.value = "";
+    els.yubikeyManagementKey.value = "";
+    await refreshInstalledCertificates();
+    await refreshYubiKeyCertificates();
+  } catch (error) {
+    showMessage(String(error), "error");
+  } finally {
+    button.disabled = false;
+  }
 }
 
 async function refreshCertificateStatus() {

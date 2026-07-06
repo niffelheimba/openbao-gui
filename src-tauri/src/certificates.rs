@@ -38,6 +38,7 @@ pub struct IssuedCertificate {
 pub struct PersonalCertificate {
     pub thumbprint: String,
     pub subject: String,
+    pub issuer: String,
     pub simple_name: String,
     #[serde(default)]
     pub dns_names: Vec<String>,
@@ -221,20 +222,22 @@ pub fn generate_yubikey_csr(
     _profile: &CertificateProfile,
     common_name: &str,
     request: &YubiKeyRequest,
-    _replace_existing: bool,
-) -> AppResult<(String, tempfile::TempDir)> {
+    replace_existing: bool,
+) -> AppResult<(String, tempfile::TempDir, bool)> {
     validate_identity(common_name)?;
     validate_yubikey_request(request)?;
     let directory = tempfile::tempdir().map_err(|_| {
         AppError::Certificate("could not create a protected temporary directory".into())
     })?;
-    if yubikey_slot_has_key(&request.slot)? {
+    let slot_has_key = yubikey_slot_has_key(&request.slot)?;
+    let slot_has_certificate = yubikey_slot_has_certificate(&request.slot, directory.path())?;
+    if slot_has_key && !replace_existing {
         return Err(AppError::Certificate(format!(
             "YubiKey PIV slot {} already contains a private key; choose another slot or clear it with YubiKey Manager before requesting a new certificate",
             request.slot
         )));
     }
-    if yubikey_slot_has_certificate(&request.slot, directory.path())? {
+    if slot_has_certificate && !replace_existing {
         return Err(AppError::Certificate(format!(
             "YubiKey PIV slot {} already contains a certificate; choose another slot or clear it with YubiKey Manager before requesting a new certificate",
             request.slot
@@ -244,31 +247,51 @@ pub fn generate_yubikey_csr(
     let csr_path = directory.path().join("yubikey-request.pem");
     let subject = format!("CN={}", common_name.replace(',', "\\,").replace('+', "\\+"));
 
-    let mut generate_args = vec![
-        "piv",
-        "keys",
-        "generate",
-        "--algorithm",
-        &request.algorithm,
-        "--pin-policy",
-        &request.pin_policy,
-        "--touch-policy",
-        &request.touch_policy,
-    ];
-    generate_args.push("--management-key");
-    generate_args.push(yubikey_management_key(request));
-    if !request.pin.is_empty() {
-        generate_args.push("--pin");
-        generate_args.push(&request.pin);
-    }
-    generate_args.push(&request.slot);
-    generate_args.push(path_text(&public_key_path)?);
-    let output = run_ykman(&generate_args)?;
-    if !output.status.success() {
-        return Err(AppError::Certificate(command_error(
-            "YubiKey Manager could not generate a PIV key",
-            &output,
-        )));
+    let generated_new_key = !slot_has_key;
+    if slot_has_key {
+        let output = run_ykman(&[
+            "piv",
+            "keys",
+            "export",
+            "--verify",
+            "--pin",
+            &request.pin,
+            &request.slot,
+            path_text(&public_key_path)?,
+        ])?;
+        if !output.status.success() {
+            return Err(AppError::Certificate(command_error(
+                "YubiKey Manager could not export the existing PIV public key",
+                &output,
+            )));
+        }
+    } else {
+        let mut generate_args = vec![
+            "piv",
+            "keys",
+            "generate",
+            "--algorithm",
+            &request.algorithm,
+            "--pin-policy",
+            &request.pin_policy,
+            "--touch-policy",
+            &request.touch_policy,
+        ];
+        generate_args.push("--management-key");
+        generate_args.push(yubikey_management_key(request));
+        if !request.pin.is_empty() {
+            generate_args.push("--pin");
+            generate_args.push(&request.pin);
+        }
+        generate_args.push(&request.slot);
+        generate_args.push(path_text(&public_key_path)?);
+        let output = run_ykman(&generate_args)?;
+        if !output.status.success() {
+            return Err(AppError::Certificate(command_error(
+                "YubiKey Manager could not generate a PIV key",
+                &output,
+            )));
+        }
     }
 
     let output = match run_ykman(&[
@@ -285,28 +308,36 @@ pub fn generate_yubikey_csr(
     ]) {
         Ok(output) => output,
         Err(error) => {
-            let _ = delete_yubikey_key(request);
+            if generated_new_key {
+                let _ = delete_yubikey_key(request);
+            }
             return Err(error);
         }
     };
     if !output.status.success() {
-        let _ = delete_yubikey_key(request);
+        if generated_new_key {
+            let _ = delete_yubikey_key(request);
+        }
         return Err(AppError::Certificate(command_error(
             "YubiKey Manager could not generate a CSR",
             &output,
         )));
     }
     let csr_pem = std::fs::read_to_string(&csr_path).map_err(|_| {
-        let _ = delete_yubikey_key(request);
+        if generated_new_key {
+            let _ = delete_yubikey_key(request);
+        }
         AppError::Certificate("YubiKey Manager did not produce a certificate request".into())
     })?;
     if !csr_pem.contains("BEGIN CERTIFICATE REQUEST") {
-        let _ = delete_yubikey_key(request);
+        if generated_new_key {
+            let _ = delete_yubikey_key(request);
+        }
         return Err(AppError::Certificate(
             "YubiKey Manager produced an unexpected CSR format".into(),
         ));
     }
-    Ok((csr_pem, directory))
+    Ok((csr_pem, directory, generated_new_key))
 }
 
 pub fn import_yubikey_certificate(
@@ -316,15 +347,20 @@ pub fn import_yubikey_certificate(
     certificate_pem: &str,
     chain_pems: &[String],
     policy: AcceptancePolicy<'_>,
+    delete_key_on_failure: bool,
 ) -> AppResult<IssuedCertificate> {
     let metadata = validate_issued_certificate(csr_pem, certificate_pem, chain_pems, &policy)
         .map(|(metadata, _)| metadata)
         .inspect_err(|_| {
-            let _ = delete_yubikey_key(request);
+            if delete_key_on_failure {
+                let _ = delete_yubikey_key(request);
+            }
         })?;
     let cert_path = directory.path().join("yubikey-certificate.pem");
     std::fs::write(&cert_path, certificate_pem).map_err(|_| {
-        let _ = delete_yubikey_key(request);
+        if delete_key_on_failure {
+            let _ = delete_yubikey_key(request);
+        }
         AppError::Certificate("could not stage the signed YubiKey certificate".into())
     })?;
     let mut args = vec![
@@ -341,13 +377,31 @@ pub fn import_yubikey_certificate(
     args.push(path_text(&cert_path)?);
     let output = run_ykman(&args)?;
     if !output.status.success() {
-        let _ = delete_yubikey_key(request);
+        if delete_key_on_failure {
+            let _ = delete_yubikey_key(request);
+        }
         return Err(AppError::Certificate(command_error(
             "YubiKey Manager could not import the signed certificate",
             &output,
         )));
     }
     Ok(metadata)
+}
+
+pub fn delete_yubikey_certificate(request: &YubiKeyRequest) -> AppResult<()> {
+    validate_yubikey_request(request)?;
+    let mut args = vec!["piv", "certificates", "delete", "--pin", &request.pin];
+    args.push("--management-key");
+    args.push(yubikey_management_key(request));
+    args.push(&request.slot);
+    let output = run_ykman(&args)?;
+    if !output.status.success() {
+        return Err(AppError::Certificate(command_error(
+            "YubiKey Manager could not remove the certificate",
+            &output,
+        )));
+    }
+    Ok(())
 }
 
 fn validate_yubikey_request(request: &YubiKeyRequest) -> AppResult<()> {
@@ -867,7 +921,7 @@ fn validate_key_usage_for_purpose(
 }
 
 pub fn list_personal_certificates() -> AppResult<Vec<PersonalCertificate>> {
-    let script = r#"[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false); $items = @(Get-ChildItem Cert:\CurrentUser\My | ForEach-Object { [pscustomobject]@{ thumbprint=$_.Thumbprint.ToLowerInvariant(); subject=$_.Subject; simpleName=$_.GetNameInfo([Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false); dnsNames=@($_.DnsNameList | ForEach-Object { if ($_.Unicode) { $_.Unicode } }); emailNames=@($_.GetNameInfo([Security.Cryptography.X509Certificates.X509NameType]::EmailName, $false) | Where-Object { $_ }); notBefore=$_.NotBefore.ToUniversalTime().ToString('o'); notAfter=$_.NotAfter.ToUniversalTime().ToString('o'); hasPrivateKey=$_.HasPrivateKey; ekuOids=@($_.EnhancedKeyUsageList | ForEach-Object { if ($_.ObjectId -and $_.ObjectId.Value) { $_.ObjectId.Value } }) } }); ConvertTo-Json -Compress -Depth 4 -InputObject $items"#;
+    let script = r#"[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false); $items = @(Get-ChildItem Cert:\CurrentUser\My | ForEach-Object { [pscustomobject]@{ thumbprint=$_.Thumbprint.ToLowerInvariant(); subject=$_.Subject; issuer=$_.Issuer; simpleName=$_.GetNameInfo([Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false); dnsNames=@($_.DnsNameList | ForEach-Object { if ($_.Unicode) { $_.Unicode } }); emailNames=@($_.GetNameInfo([Security.Cryptography.X509Certificates.X509NameType]::EmailName, $false) | Where-Object { $_ }); notBefore=$_.NotBefore.ToUniversalTime().ToString('o'); notAfter=$_.NotAfter.ToUniversalTime().ToString('o'); hasPrivateKey=$_.HasPrivateKey; ekuOids=@($_.EnhancedKeyUsageList | ForEach-Object { if ($_.ObjectId -and $_.ObjectId.Value) { $_.ObjectId.Value } }) } }); ConvertTo-Json -Compress -Depth 4 -InputObject $items"#;
     let output = run_windows(
         "powershell.exe",
         &[
@@ -893,6 +947,23 @@ pub fn list_personal_certificates() -> AppResult<Vec<PersonalCertificate>> {
     serde_json::from_str(&text).map_err(|_| {
         AppError::Certificate("Windows returned malformed certificate-store data".into())
     })
+}
+
+pub fn remove_personal_certificate(thumbprint: &str) -> AppResult<()> {
+    if thumbprint.len() != 40 || !thumbprint.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(AppError::Certificate(
+            "certificate thumbprint is invalid".into(),
+        ));
+    }
+    let normalized = thumbprint.to_ascii_uppercase();
+    let output = run_windows("certutil.exe", &["-user", "-delstore", "My", &normalized])?;
+    if !output.status.success() {
+        return Err(AppError::Certificate(command_error(
+            "Windows could not remove the certificate from CurrentUser\\My",
+            &output,
+        )));
+    }
+    Ok(())
 }
 
 pub fn certificates_for_profile(
@@ -1055,6 +1126,7 @@ fn personal_certificate_from_pem(
     Ok(PersonalCertificate {
         thumbprint,
         subject: cert.subject().to_string(),
+        issuer: cert.issuer().to_string(),
         simple_name,
         dns_names,
         email_names,
@@ -1184,6 +1256,7 @@ mod tests {
         let matching = PersonalCertificate {
             thumbprint: "a".repeat(40),
             subject: "CN=alice@example.test".into(),
+            issuer: "CN=test issuer".into(),
             simple_name: "alice@example.test".into(),
             dns_names: Vec::new(),
             email_names: vec!["alice@example.test".into()],
@@ -1214,6 +1287,7 @@ mod tests {
         let mut certificate = PersonalCertificate {
             thumbprint: "a".repeat(40),
             subject: "CN=alice".into(),
+            issuer: "CN=test issuer".into(),
             simple_name: String::new(),
             dns_names: Vec::new(),
             email_names: Vec::new(),
