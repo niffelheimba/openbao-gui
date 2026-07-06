@@ -154,6 +154,18 @@
         <div id="yubikey-profiles" class="stack"><p class="muted">YubiKey issuance is planned but not implemented in this build.</p></div>
       </section>
 
+      <section class="card inventory-card yubikey-inventory">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">YUBIKEY</p>
+            <h2>YubiKey certificates</h2>
+            <p>Certificates and key presence reported by YubiKey PIV slots. Requires YubiKey Manager CLI <span class="meta-inline">(ykman)</span>.</p>
+          </div>
+          <button id="refresh-yubikey-certificates" class="quiet">Refresh</button>
+        </div>
+        <div id="yubikey-certificates" class="stack"><p class="muted">Loading…</p></div>
+      </section>
+
       <footer>
         <span id="deployment-name">Unconfigured deployment</span>
         <span>v0.1.0</span>

@@ -700,6 +700,13 @@ async fn list_all_personal_certificates() -> AppResult<Vec<certificates::Persona
         .map_err(|_| AppError::Internal)?
 }
 
+#[tauri::command]
+async fn list_yubikey_certificates() -> AppResult<Vec<certificates::YubiKeySlotCertificate>> {
+    tokio::task::spawn_blocking(certificates::list_yubikey_certificates)
+        .await
+        .map_err(|_| AppError::Internal)?
+}
+
 fn ensure_configured(config: &DeploymentConfig) -> AppResult<()> {
     if config.configured {
         Ok(())
@@ -807,6 +814,7 @@ pub fn run() {
             cancel_login,
             logout,
             list_all_personal_certificates,
+            list_yubikey_certificates,
             list_certificate_status,
             issue_yubikey_certificate,
             issue_certificate

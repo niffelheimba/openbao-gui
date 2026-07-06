@@ -56,6 +56,15 @@ pub struct ProfileCertificateStatus {
     pub certificates: Vec<PersonalCertificate>,
 }
 
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct YubiKeySlotCertificate {
+    pub slot: String,
+    pub label: String,
+    pub has_private_key: bool,
+    pub certificate: Option<PersonalCertificate>,
+}
+
 pub struct YubiKeyRequest {
     pub slot: String,
     pub pin: String,
@@ -414,6 +423,45 @@ fn yubikey_management_key(request: &YubiKeyRequest) -> &str {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .unwrap_or(DEFAULT_YUBIKEY_MANAGEMENT_KEY)
+}
+
+pub fn list_yubikey_certificates() -> AppResult<Vec<YubiKeySlotCertificate>> {
+    const SLOTS: &[(&str, &str)] = &[
+        ("9a", "Authentication"),
+        ("9c", "Digital signature"),
+        ("9d", "Key management"),
+        ("9e", "Card authentication"),
+    ];
+    let directory = tempfile::tempdir().map_err(|_| {
+        AppError::Certificate("could not create a protected temporary directory".into())
+    })?;
+    let mut results = Vec::with_capacity(SLOTS.len());
+    for (slot, label) in SLOTS {
+        let has_private_key = yubikey_slot_has_key(slot)?;
+        let cert_path = directory.path().join(format!("yubikey-slot-{slot}.pem"));
+        let output = run_ykman(&[
+            "piv",
+            "certificates",
+            "export",
+            slot,
+            path_text(&cert_path)?,
+        ])?;
+        let certificate = if output.status.success() && cert_path.exists() {
+            let pem = std::fs::read_to_string(&cert_path).map_err(|_| {
+                AppError::Certificate("YubiKey certificate could not be read".into())
+            })?;
+            Some(personal_certificate_from_pem(&pem, has_private_key)?)
+        } else {
+            None
+        };
+        results.push(YubiKeySlotCertificate {
+            slot: (*slot).to_owned(),
+            label: (*label).to_owned(),
+            has_private_key,
+            certificate,
+        });
+    }
+    Ok(results)
 }
 
 impl Drop for PendingRequest {
@@ -973,6 +1021,48 @@ fn certificate_eku_oids(cert: &X509Certificate<'_>) -> Vec<String> {
         }
     }
     result
+}
+
+fn personal_certificate_from_pem(
+    certificate_pem: &str,
+    has_private_key: bool,
+) -> AppResult<PersonalCertificate> {
+    let block = ::pem::parse(certificate_pem)
+        .map_err(|_| AppError::Certificate("YubiKey returned an invalid certificate PEM".into()))?;
+    let (_, cert) = X509Certificate::from_der(block.contents()).map_err(|_| {
+        AppError::Certificate("YubiKey returned an invalid X.509 certificate".into())
+    })?;
+    let thumbprint = hex::encode(sha1::Sha1::digest(block.contents())).to_ascii_lowercase();
+    let simple_name = cert
+        .subject()
+        .iter_common_name()
+        .find_map(|value| value.as_str().ok())
+        .unwrap_or_default()
+        .to_owned();
+    let mut dns_names = Vec::new();
+    let mut email_names = Vec::new();
+    for extension in cert.extensions() {
+        if let ParsedExtension::SubjectAlternativeName(san) = extension.parsed_extension() {
+            for name in &san.general_names {
+                match name {
+                    GeneralName::DNSName(value) => dns_names.push((*value).to_owned()),
+                    GeneralName::RFC822Name(value) => email_names.push((*value).to_owned()),
+                    _ => {}
+                }
+            }
+        }
+    }
+    Ok(PersonalCertificate {
+        thumbprint,
+        subject: cert.subject().to_string(),
+        simple_name,
+        dns_names,
+        email_names,
+        not_before: cert.validity().not_before.to_string(),
+        not_after: cert.validity().not_after.to_string(),
+        has_private_key,
+        eku_oids: certificate_eku_oids(&cert),
+    })
 }
 
 fn decode_csr_pem(value: &str) -> AppResult<Vec<u8>> {

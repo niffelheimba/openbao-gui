@@ -7,6 +7,7 @@ const els = {
   message: document.querySelector("#message"),
   roots: document.querySelector("#roots"),
   installedCertificates: document.querySelector("#installed-certificates"),
+  yubikeyCertificates: document.querySelector("#yubikey-certificates"),
   profiles: document.querySelector("#profiles"),
   yubikeyProfiles: document.querySelector("#yubikey-profiles"),
   sessionSummary: document.querySelector("#session-summary"),
@@ -14,6 +15,7 @@ const els = {
   deploymentName: document.querySelector("#deployment-name"),
   refreshRoots: document.querySelector("#refresh-roots"),
   refreshCertificates: document.querySelector("#refresh-certificates"),
+  refreshYubiKeyCertificates: document.querySelector("#refresh-yubikey-certificates"),
   serverForm: document.querySelector("#server-settings"),
   serverAddress: document.querySelector("#server-address"),
   serverNamespace: document.querySelector("#server-namespace"),
@@ -71,6 +73,7 @@ async function refresh() {
     renderSession();
     await refreshRoots();
     await refreshInstalledCertificates();
+    await refreshYubiKeyCertificates();
     await refreshCertificateStatus();
     renderProfiles();
     renderYubiKeyProfiles();
@@ -157,6 +160,11 @@ function certificatePurpose(certificate) {
   return labels.join(" / ");
 }
 
+function formatCertificateDate(value) {
+  const parsed = Date.parse(value);
+  return Number.isNaN(parsed) ? value : new Date(parsed).toLocaleString();
+}
+
 async function refreshInstalledCertificates() {
   try {
     const certificates = await invoke("list_all_personal_certificates");
@@ -168,7 +176,7 @@ async function refreshInstalledCertificates() {
         <div>
           <p><strong>${escapeHtml(certificate.simpleName || certificate.subject)}</strong></p>
           <p class="muted">${escapeHtml(certificatePurpose(certificate))}${certificate.hasPrivateKey ? " / private key available" : " / no private key"}</p>
-          <p class="muted">Expires ${new Date(certificate.notAfter).toLocaleString()}</p>
+          <p class="muted">Expires ${escapeHtml(formatCertificateDate(certificate.notAfter))}</p>
           ${certificate.emailNames?.length ? `<p class="muted">Email ${escapeHtml(certificate.emailNames.join(", "))}</p>` : ""}
           ${certificate.dnsNames?.length ? `<p class="muted">DNS ${escapeHtml(certificate.dnsNames.join(", "))}</p>` : ""}
           <p class="meta">Thumbprint ${escapeHtml(certificate.thumbprint)}</p>
@@ -176,6 +184,36 @@ async function refreshInstalledCertificates() {
       </div>`).join("") : '<p class="muted">No client/signing/email certificates were found in CurrentUser\\My.</p>';
   } catch (error) {
     els.installedCertificates.innerHTML = `<p class="muted">${escapeHtml(error)}</p>`;
+  }
+}
+
+async function refreshYubiKeyCertificates() {
+  try {
+    const slots = await invoke("list_yubikey_certificates");
+    els.yubikeyCertificates.innerHTML = slots.length ? slots.map(slot => {
+      const certificate = slot.certificate;
+      const statusText = certificate
+        ? `${certificatePurpose(certificate)} / ${slot.hasPrivateKey ? "hardware private key present" : "certificate only"}`
+        : slot.hasPrivateKey
+          ? "Private key present; no certificate found in this slot."
+          : "Empty slot.";
+      return `
+      <div class="row cert-row">
+        <div>
+          <p><strong>Slot ${escapeHtml(slot.slot)} - ${escapeHtml(slot.label)}</strong></p>
+          <p class="muted">${escapeHtml(statusText)}</p>
+          ${certificate ? `
+            <p class="muted">${escapeHtml(certificate.simpleName || certificate.subject)}</p>
+            <p class="muted">Expires ${escapeHtml(formatCertificateDate(certificate.notAfter))}</p>
+            ${certificate.emailNames?.length ? `<p class="muted">Email ${escapeHtml(certificate.emailNames.join(", "))}</p>` : ""}
+            ${certificate.dnsNames?.length ? `<p class="muted">DNS ${escapeHtml(certificate.dnsNames.join(", "))}</p>` : ""}
+            <p class="meta">Thumbprint ${escapeHtml(certificate.thumbprint)}</p>
+          ` : ""}
+        </div>
+      </div>`;
+    }).join("") : '<p class="muted">No YubiKey PIV slots were reported.</p>';
+  } catch (error) {
+    els.yubikeyCertificates.innerHTML = `<p class="muted">${escapeHtml(error)}</p>`;
   }
 }
 
@@ -249,7 +287,7 @@ function renderYubiKeyProfiles() {
     const profileId = button.dataset.yubikeyProfile;
     if (!confirm(`Generate a new key on YubiKey PIV slot ${slot} and request this certificate?\n\nThis build will not overwrite an existing YubiKey key or certificate. If the slot is occupied, choose another slot or clear it with YubiKey Manager first.`)) return;
     button.disabled = true;
-    showMessage("Generating a YubiKey key and requesting the certificate. Touch the YubiKey if prompted...");
+    showMessage("YubiKey request running. If the YubiKey starts blinking, touch its metal contact now; there may not be a separate Windows prompt.", "warning");
     try {
       const result = await invoke("issue_yubikey_certificate", {
         request: {
@@ -268,6 +306,7 @@ function renderYubiKeyProfiles() {
       els.yubikeyPin.value = "";
       els.yubikeyManagementKey.value = "";
       await refreshInstalledCertificates();
+      await refreshYubiKeyCertificates();
     } catch (error) {
       showMessage(String(error), "error");
     } finally {
@@ -326,6 +365,7 @@ els.sessionAction.addEventListener("click", async () => {
 
 els.refreshRoots.addEventListener("click", refreshRoots);
 els.refreshCertificates.addEventListener("click", refreshInstalledCertificates);
+els.refreshYubiKeyCertificates.addEventListener("click", refreshYubiKeyCertificates);
 els.checkConnection.addEventListener("click", async () => {
   els.checkConnection.disabled = true;
   showMessage("Checking OpenBao over Windows-trusted HTTPS...");
