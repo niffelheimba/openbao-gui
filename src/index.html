@@ -110,7 +110,7 @@
           </div>
         </div>
         <div class="settings-grid yubikey-settings">
-          <label>PIV slot
+          <label>Default PIV slot
             <select id="yubikey-slot">
               <option value="9a">9a - Authentication</option>
               <option value="9c">9c - Digital signature</option>
@@ -149,7 +149,7 @@
           <label>Management key <span class="muted">(optional)</span>
             <input id="yubikey-management-key" type="password" autocomplete="off" placeholder="Blank uses the default YubiKey PIV key" />
           </label>
-          <p class="wide muted settings-note">The PIN and management key are used only for this request and are not saved. If the management key field is blank, the app supplies the standard default YubiKey PIV management key so ykman will not prompt invisibly.</p>
+          <p class="wide muted settings-note">The PIN and management key are used only for this request and are not saved. Each profile can choose a slot below; the default selector is kept for compatibility. If the management key field is blank, the app supplies the standard default YubiKey PIV management key so ykman will not prompt invisibly. Touch prompts are shown by the YubiKey blinking rather than a Windows dialog.</p>
         </div>
         <div id="yubikey-profiles" class="stack"><p class="muted">YubiKey issuance is planned but not implemented in this build.</p></div>
       </section>

@@ -27,7 +27,7 @@
                          "label":  "User mTLS",
                          "description":  "Client authentication for homelab services",
                          "purpose":  "mtls",
-                         "pki_mount":  "pki_intermediate",
+                         "pki_mount":  "pki_user_mtls",
                          "pki_role":  "northlake-users",
                          "subject_claim":  "preferred_username",
                          "san_claim":  null,

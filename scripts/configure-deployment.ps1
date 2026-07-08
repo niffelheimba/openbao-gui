@@ -6,7 +6,7 @@ param(
     [string]$Namespace,
     [string]$AuthMount = "oidc",
     [string]$OidcRole = "desktop-certificates",
-    [string]$PkiMount = "pki-users",
+    [string]$PkiMount = "pki_user_mtls",
     [string]$MtlsRole = "user-mtls",
     [string]$IdentityDisplayClaim = "preferred_username",
     [string]$IdentitySubjectClaim = "sub",

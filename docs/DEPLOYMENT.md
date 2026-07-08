@@ -103,7 +103,125 @@ Before building the client, test with two accounts:
 If any negative test succeeds, stop. Fix OpenBao policy before distributing the
 client.
 
-## 3. Embed the deployment
+## 3. Split PKI mounts by trust domain
+
+Use separate PKI mounts when certificate families have different revocation
+authority, risk, or operators. The desktop app's user mTLS profile should not
+share a mount with internal server TLS or code-signing certificates, because
+OpenBao's raw PKI revoke endpoint is scoped at the mount path.
+
+The recommended Northlake layout is:
+
+```text
+pki_user_mtls
+pki_internal_server_tls
+pki_code_signing        # optional, only when code signing is deployed
+```
+
+For the desktop app, grant the user policy only the user-mTLS mount:
+
+```hcl
+path "pki_user_mtls/sign/northlake-users" {
+  capabilities = ["update"]
+}
+
+path "pki_user_mtls/revoke" {
+  capabilities = ["update"]
+}
+
+path "pki_user_mtls/cert/*" {
+  capabilities = ["read"]
+}
+```
+
+Do not grant the desktop user policy `update` on
+`pki_internal_server_tls/revoke`. Server certificates should be issued and
+revoked by infrastructure automation or an operator policy, not by the user
+certificate client.
+
+If renaming an existing mount, remember that previously issued certificates
+contain their original AIA and CRL URLs. Prefer doing this before production
+issuance, or keep the old path reachable until old certificates expire.
+
+Example mount setup:
+
+```powershell
+bao secrets move pki_intermediate pki_user_mtls
+bao write pki_user_mtls/config/urls `
+  issuing_certificates="https://secrets.cloud.northlake.dev/v1/pki_user_mtls/ca" `
+  crl_distribution_points="https://secrets.cloud.northlake.dev/v1/pki_user_mtls/crl"
+bao write pki_user_mtls/config/crl `
+  expiry="720h" `
+  auto_rebuild=true `
+  auto_rebuild_grace_period="24h" `
+  enable_delta=false
+
+bao secrets enable `
+  -path=pki_internal_server_tls `
+  -description="Northlake internal server TLS PKI" `
+  -max-lease-ttl=87600h `
+  pki
+bao write pki_internal_server_tls/config/urls `
+  issuing_certificates="https://secrets.cloud.northlake.dev/v1/pki_internal_server_tls/ca" `
+  crl_distribution_points="https://secrets.cloud.northlake.dev/v1/pki_internal_server_tls/crl"
+bao write pki_internal_server_tls/config/crl `
+  expiry="720h" `
+  auto_rebuild=true `
+  auto_rebuild_grace_period="24h" `
+  enable_delta=false
+```
+
+The server-TLS mount still needs its own issuing CA before it can sign server
+leaf certificates. Generate a server-TLS intermediate CSR under
+`pki_internal_server_tls`, sign it with the offline/root CA, then import the
+signed intermediate back into that mount.
+
+```powershell
+bao write -format=json `
+  pki_internal_server_tls/intermediate/generate/internal `
+  common_name="Northlake Internal Server TLS Issuing CA 01" `
+  key_type=rsa `
+  key_bits=4096 `
+  ttl=131400h
+```
+
+After signing the CSR with the root CA:
+
+```powershell
+bao write pki_internal_server_tls/intermediate/set-signed `
+  certificate=@".\northlake-internal-server-tls-issuing-ca-01.crt.pem"
+```
+
+The initial internal server role should be narrow. For Northlake, the
+`internal-home-server` role allows only subdomains below `home.northlake.dev`,
+sets Server Authentication, and does not allow client-auth, code-signing,
+localhost, IP SANs, or bare-domain issuance:
+
+```powershell
+bao write pki_internal_server_tls/roles/internal-home-server `
+  allowed_domains=home.northlake.dev `
+  allow_subdomains=true `
+  allow_bare_domains=false `
+  allow_wildcard_certificates=true `
+  allow_ip_sans=false `
+  allow_localhost=false `
+  server_flag=true `
+  client_flag=false `
+  code_signing_flag=false `
+  email_protection_flag=false `
+  ext_key_usage=ServerAuth `
+  key_usage=DigitalSignature,KeyEncipherment `
+  key_type=rsa `
+  key_bits=2048 `
+  ttl=720h `
+  max_ttl=2160h `
+  require_cn=true `
+  enforce_hostnames=true `
+  generate_lease=false `
+  no_store=false
+```
+
+## 4. Embed the deployment
 
 For an mTLS-only first build, generate the deployment file from your CA
 certificate instead of editing JSON manually:
@@ -113,7 +231,7 @@ certificate instead of editing JSON manually:
   -DeploymentName "My Homelab" `
   -OpenBaoAddress "https://bao.home.example:8200" `
   -RootCertificate ".\homelab-root.cer" `
-  -PkiMount "pki-users" `
+  -PkiMount "pki_user_mtls" `
   -MtlsRole "user-mtls"
 ```
 
@@ -177,7 +295,7 @@ directory and apply after exiting from the tray and reopening the app. The new
 direct callback URL must also be present in that OpenBao OIDC role's
 `allowed_redirect_uris`. Use **Use embedded defaults** to remove the override.
 
-## 4. Build and distribute
+## 5. Build and distribute
 
 For a local smoke-test installer before the real homelab deployment is embedded,
 build in preview mode:
@@ -220,7 +338,7 @@ Uninstalling intentionally leaves enrolled roots and personal certificates in
 place. Users can remove a configured root explicitly in the application before
 uninstalling.
 
-## 5. Hardware-backed keys with YubiKey PIV
+## 6. Hardware-backed keys with YubiKey PIV
 
 YubiKey support is planned after the v1 software-key release. Treat it as a
 separate certificate profile family, not as a transparent replacement for the

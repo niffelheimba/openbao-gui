@@ -358,6 +358,23 @@ impl OpenBaoClient {
             .data
             .ok_or_else(|| AppError::Api("OpenBao returned no signed certificate".into()))
     }
+
+    pub async fn revoke_certificate(
+        &self,
+        token: &SecretString,
+        mount: &str,
+        serial_number: &str,
+    ) -> AppResult<()> {
+        let response = self
+            .http
+            .post(self.url(&format!("{mount}/revoke"))?)
+            .headers(self.headers(Some(token))?)
+            .json(&json!({ "serial_number": serial_number }))
+            .send()
+            .await?;
+        let _envelope: Envelope<Value> = decode(response).await?;
+        Ok(())
+    }
 }
 
 async fn decode<T: for<'de> Deserialize<'de>>(

@@ -29,13 +29,45 @@ struct AppStatus {
     deployment_name: String,
     session: Option<PublicSession>,
     profiles: Vec<CertificateProfile>,
+    profile_identities: Vec<ProfileIdentity>,
     server_settings: ServerSettings,
     server_override: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProfileIdentity {
+    profile_id: String,
+    identity: String,
+    san: Option<String>,
 }
 
 #[tauri::command]
 async fn get_app_status(state: tauri::State<'_, AppState>) -> AppResult<AppStatus> {
     let runtime = state.runtime.lock().await;
+    let profile_identities = runtime
+        .session
+        .as_ref()
+        .map(|session| {
+            state
+                .config
+                .profiles
+                .iter()
+                .filter_map(|profile| {
+                    let identity = session.metadata.get(&profile.subject_claim)?.clone();
+                    let san = profile
+                        .san_claim
+                        .as_ref()
+                        .and_then(|claim| session.metadata.get(claim).cloned());
+                    Some(ProfileIdentity {
+                        profile_id: profile.id.clone(),
+                        identity,
+                        san,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     Ok(AppStatus {
         configured: state.config.configured,
         configuration_message: if state.config.configured {
@@ -46,6 +78,7 @@ async fn get_app_status(state: tauri::State<'_, AppState>) -> AppResult<AppStatu
         deployment_name: state.config.deployment_name.clone(),
         session: runtime.session.as_ref().map(PublicSession::from),
         profiles: state.config.profiles.clone(),
+        profile_identities,
         server_settings: ServerSettings::from(&state.config.openbao),
         server_override: state.server_override,
     })
@@ -660,14 +693,37 @@ async fn issue_yubikey_certificate(
 
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct RemoveCertificateRequest {
+    thumbprint: Option<String>,
+    serial_number: String,
+    pki_mount: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct RemoveYubiKeyCertificateRequest {
     slot: String,
+    serial_number: String,
+    pki_mount: Option<String>,
     pin: String,
     management_key: Option<String>,
 }
 
 #[tauri::command]
-async fn remove_yubikey_certificate(request: RemoveYubiKeyCertificateRequest) -> AppResult<()> {
+async fn remove_yubikey_certificate(
+    request: RemoveYubiKeyCertificateRequest,
+    state: tauri::State<'_, AppState>,
+) -> AppResult<()> {
+    let pki_mount = infer_certificate_pki_mount(&state.config, request.pki_mount.as_deref())?;
+    let token = with_active_session(&state, |session| {
+        Ok(SecretString::from(session.token.expose_secret().to_owned()))
+    })
+    .await?;
+    let serial_number = certificates::normalize_certificate_serial(&request.serial_number);
+    state
+        .api
+        .revoke_certificate(&token, &pki_mount, &serial_number)
+        .await?;
     let yubikey_request = YubiKeyRequest {
         slot: request.slot,
         pin: request.pin,
@@ -679,6 +735,37 @@ async fn remove_yubikey_certificate(request: RemoveYubiKeyCertificateRequest) ->
     tokio::task::spawn_blocking(move || certificates::delete_yubikey_certificate(&yubikey_request))
         .await
         .map_err(|_| AppError::Internal)?
+}
+
+fn infer_certificate_pki_mount(
+    config: &DeploymentConfig,
+    requested: Option<&str>,
+) -> AppResult<String> {
+    if let Some(requested) = requested.filter(|value| !value.trim().is_empty()) {
+        if config
+            .profiles
+            .iter()
+            .any(|profile| profile.pki_mount == requested)
+        {
+            return Ok(requested.to_owned());
+        }
+        return Err(AppError::Certificate(
+            "certificate does not belong to a configured OpenBao PKI mount".into(),
+        ));
+    }
+
+    let mounts = config
+        .profiles
+        .iter()
+        .map(|profile| profile.pki_mount.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    if mounts.len() == 1 {
+        return Ok(mounts.into_iter().next().unwrap_or_default().to_owned());
+    }
+
+    Err(AppError::Certificate(
+        "certificate revocation needs an unambiguous OpenBao PKI mount".into(),
+    ))
 }
 
 #[tauri::command]
@@ -728,7 +815,24 @@ async fn list_all_personal_certificates() -> AppResult<Vec<certificates::Persona
 }
 
 #[tauri::command]
-async fn remove_personal_certificate(thumbprint: String) -> AppResult<()> {
+async fn remove_personal_certificate(
+    request: RemoveCertificateRequest,
+    state: tauri::State<'_, AppState>,
+) -> AppResult<()> {
+    let thumbprint = request
+        .thumbprint
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| AppError::Certificate("certificate thumbprint is required".into()))?;
+    let pki_mount = infer_certificate_pki_mount(&state.config, request.pki_mount.as_deref())?;
+    let token = with_active_session(&state, |session| {
+        Ok(SecretString::from(session.token.expose_secret().to_owned()))
+    })
+    .await?;
+    let serial_number = certificates::normalize_certificate_serial(&request.serial_number);
+    state
+        .api
+        .revoke_certificate(&token, &pki_mount, &serial_number)
+        .await?;
     tokio::task::spawn_blocking(move || certificates::remove_personal_certificate(&thumbprint))
         .await
         .map_err(|_| AppError::Internal)?

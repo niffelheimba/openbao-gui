@@ -37,6 +37,7 @@ pub struct IssuedCertificate {
 #[serde(rename_all = "camelCase")]
 pub struct PersonalCertificate {
     pub thumbprint: String,
+    pub serial_number: String,
     pub subject: String,
     pub issuer: String,
     pub simple_name: String,
@@ -63,6 +64,9 @@ pub struct YubiKeySlotCertificate {
     pub slot: String,
     pub label: String,
     pub has_private_key: bool,
+    pub key_algorithm: Option<String>,
+    pub pin_policy: Option<String>,
+    pub touch_policy: Option<String>,
     pub certificate: Option<PersonalCertificate>,
 }
 
@@ -445,20 +449,34 @@ fn yubikey_slot_has_certificate(slot: &str, directory: &std::path::Path) -> AppR
 
 fn yubikey_slot_has_key(slot: &str) -> AppResult<bool> {
     let output = run_ykman(&["piv", "keys", "info", slot])?;
+    Ok(yubikey_key_info_from_output(&output)?.is_some())
+}
+
+fn yubikey_key_info_from_output(
+    output: &std::process::Output,
+) -> AppResult<Option<YubiKeyKeyInfo>> {
     let text = format!(
         "{}\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
-    )
-    .to_ascii_lowercase();
+    );
     if output.status.success() {
-        return Ok(true);
+        return Ok(Some(parse_yubikey_key_info(&text)));
     }
-    Ok(!(text.contains("no key")
-        || text.contains("not found")
-        || text.contains("object not found")
-        || text.contains("not present")
-        || text.contains("empty")))
+    let lowered = text.to_ascii_lowercase();
+    if lowered.contains("no key")
+        || lowered.contains("not found")
+        || lowered.contains("object not found")
+        || lowered.contains("not present")
+        || lowered.contains("empty")
+    {
+        Ok(None)
+    } else {
+        Err(AppError::Certificate(command_error(
+            "YubiKey Manager could not inspect the PIV slot",
+            output,
+        )))
+    }
 }
 
 fn delete_yubikey_key(request: &YubiKeyRequest) -> AppResult<()> {
@@ -468,6 +486,34 @@ fn delete_yubikey_key(request: &YubiKeyRequest) -> AppResult<()> {
     args.push(&request.slot);
     let _ = run_ykman(&args)?;
     Ok(())
+}
+
+#[derive(Clone, Debug, Default)]
+struct YubiKeyKeyInfo {
+    algorithm: Option<String>,
+    pin_policy: Option<String>,
+    touch_policy: Option<String>,
+}
+
+fn parse_yubikey_key_info(text: &str) -> YubiKeyKeyInfo {
+    let mut info = YubiKeyKeyInfo::default();
+    for line in text.lines() {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let key = key.trim().to_ascii_lowercase();
+        let value = value.trim();
+        if value.is_empty() {
+            continue;
+        }
+        match key.as_str() {
+            "algorithm" => info.algorithm = Some(value.to_owned()),
+            "pin policy" => info.pin_policy = Some(value.to_owned()),
+            "touch policy" => info.touch_policy = Some(value.to_owned()),
+            _ => {}
+        }
+    }
+    info
 }
 
 fn yubikey_management_key(request: &YubiKeyRequest) -> &str {
@@ -491,7 +537,8 @@ pub fn list_yubikey_certificates() -> AppResult<Vec<YubiKeySlotCertificate>> {
     })?;
     let mut results = Vec::with_capacity(SLOTS.len());
     for (slot, label) in SLOTS {
-        let has_private_key = yubikey_slot_has_key(slot)?;
+        let key_info = yubikey_key_info_from_output(&run_ykman(&["piv", "keys", "info", slot])?)?;
+        let has_private_key = key_info.is_some();
         let cert_path = directory.path().join(format!("yubikey-slot-{slot}.pem"));
         let output = run_ykman(&[
             "piv",
@@ -512,6 +559,9 @@ pub fn list_yubikey_certificates() -> AppResult<Vec<YubiKeySlotCertificate>> {
             slot: (*slot).to_owned(),
             label: (*label).to_owned(),
             has_private_key,
+            key_algorithm: key_info.as_ref().and_then(|info| info.algorithm.clone()),
+            pin_policy: key_info.as_ref().and_then(|info| info.pin_policy.clone()),
+            touch_policy: key_info.and_then(|info| info.touch_policy),
             certificate,
         });
     }
@@ -921,7 +971,7 @@ fn validate_key_usage_for_purpose(
 }
 
 pub fn list_personal_certificates() -> AppResult<Vec<PersonalCertificate>> {
-    let script = r#"[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false); $items = @(Get-ChildItem Cert:\CurrentUser\My | ForEach-Object { [pscustomobject]@{ thumbprint=$_.Thumbprint.ToLowerInvariant(); subject=$_.Subject; issuer=$_.Issuer; simpleName=$_.GetNameInfo([Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false); dnsNames=@($_.DnsNameList | ForEach-Object { if ($_.Unicode) { $_.Unicode } }); emailNames=@($_.GetNameInfo([Security.Cryptography.X509Certificates.X509NameType]::EmailName, $false) | Where-Object { $_ }); notBefore=$_.NotBefore.ToUniversalTime().ToString('o'); notAfter=$_.NotAfter.ToUniversalTime().ToString('o'); hasPrivateKey=$_.HasPrivateKey; ekuOids=@($_.EnhancedKeyUsageList | ForEach-Object { if ($_.ObjectId -and $_.ObjectId.Value) { $_.ObjectId.Value } }) } }); ConvertTo-Json -Compress -Depth 4 -InputObject $items"#;
+    let script = r#"[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false); $items = @(Get-ChildItem Cert:\CurrentUser\My | ForEach-Object { [pscustomobject]@{ thumbprint=$_.Thumbprint.ToLowerInvariant(); serialNumber=$_.SerialNumber.ToLowerInvariant(); subject=$_.Subject; issuer=$_.Issuer; simpleName=$_.GetNameInfo([Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false); dnsNames=@($_.DnsNameList | ForEach-Object { if ($_.Unicode) { $_.Unicode } }); emailNames=@($_.GetNameInfo([Security.Cryptography.X509Certificates.X509NameType]::EmailName, $false) | Where-Object { $_ }); notBefore=$_.NotBefore.ToUniversalTime().ToString('o'); notAfter=$_.NotAfter.ToUniversalTime().ToString('o'); hasPrivateKey=$_.HasPrivateKey; ekuOids=@($_.EnhancedKeyUsageList | ForEach-Object { if ($_.ObjectId -and $_.ObjectId.Value) { $_.ObjectId.Value } }) } }); ConvertTo-Json -Compress -Depth 4 -InputObject $items"#;
     let output = run_windows(
         "powershell.exe",
         &[
@@ -973,12 +1023,17 @@ pub fn certificates_for_profile(
 ) -> Vec<PersonalCertificate> {
     all.iter()
         .filter(|certificate| {
-            certificate.has_private_key
-                && certificate_matches_identity(certificate, identity)
-                && profile
-                    .expected_eku_oids
-                    .iter()
-                    .all(|expected| certificate.eku_oids.iter().any(|actual| actual == expected))
+            if !certificate.has_private_key || !certificate_matches_identity(certificate, identity)
+            {
+                return false;
+            }
+            if certificate.eku_oids.is_empty() {
+                return true;
+            }
+            profile
+                .expected_eku_oids
+                .iter()
+                .all(|expected| certificate.eku_oids.iter().any(|actual| actual == expected))
         })
         .cloned()
         .collect()
@@ -1125,6 +1180,7 @@ fn personal_certificate_from_pem(
     }
     Ok(PersonalCertificate {
         thumbprint,
+        serial_number: normalize_certificate_serial(&cert.tbs_certificate.raw_serial_as_string()),
         subject: cert.subject().to_string(),
         issuer: cert.issuer().to_string(),
         simple_name,
@@ -1135,6 +1191,22 @@ fn personal_certificate_from_pem(
         has_private_key,
         eku_oids: certificate_eku_oids(&cert),
     })
+}
+
+pub fn normalize_certificate_serial(value: &str) -> String {
+    let mut hex = value
+        .chars()
+        .filter(|character| character.is_ascii_hexdigit())
+        .collect::<String>()
+        .to_ascii_lowercase();
+    if hex.len() % 2 == 1 {
+        hex.insert(0, '0');
+    }
+    hex.as_bytes()
+        .chunks(2)
+        .filter_map(|chunk| std::str::from_utf8(chunk).ok())
+        .collect::<Vec<_>>()
+        .join(":")
 }
 
 fn decode_csr_pem(value: &str) -> AppResult<Vec<u8>> {
@@ -1255,6 +1327,7 @@ mod tests {
         };
         let matching = PersonalCertificate {
             thumbprint: "a".repeat(40),
+            serial_number: "01".into(),
             subject: "CN=alice@example.test".into(),
             issuer: "CN=test issuer".into(),
             simple_name: "alice@example.test".into(),
@@ -1286,6 +1359,7 @@ mod tests {
     fn certificate_identity_can_match_cn_dns_or_email() {
         let mut certificate = PersonalCertificate {
             thumbprint: "a".repeat(40),
+            serial_number: "01".into(),
             subject: "CN=alice".into(),
             issuer: "CN=test issuer".into(),
             simple_name: String::new(),

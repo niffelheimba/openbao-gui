@@ -35,6 +35,7 @@ const els = {
 let status;
 let loginPending = false;
 let certificateStatuses = new Map();
+let yubiKeySlots = [];
 let serverSettingsLoaded = false;
 
 function escapeHtml(value) {
@@ -72,9 +73,9 @@ async function refresh() {
     }
     renderSession();
     await refreshRoots();
+    await refreshCertificateStatus();
     await refreshInstalledCertificates();
     await refreshYubiKeyCertificates();
-    await refreshCertificateStatus();
     renderProfiles();
     renderYubiKeyProfiles();
   } catch (error) {
@@ -185,21 +186,95 @@ function certificateMatchesIdentity(certificate, identity) {
 
 function matchingConfiguredProfiles(certificate) {
   const profiles = status?.profiles ?? [];
-  const identity = status?.session?.identity ?? "";
+  const identities = new Map((status?.profileIdentities ?? []).map(item => [item.profileId, item]));
   return profiles.filter(profile => {
     const expected = profileExpectedEkus(profile);
-    const hasEkus = expected.every(oid => (certificate.ekuOids ?? []).includes(oid));
-    return hasEkus && certificateMatchesIdentity(certificate, identity);
+    const identity = identities.get(profile.id);
+    const hasIdentityMatch = identity
+      ? certificateMatchesIdentity(certificate, identity.identity) || (identity.san && certificateMatchesIdentity(certificate, identity.san))
+      : false;
+    const hasEkus = expected.length > 0
+      ? expected.every(oid => (certificate.ekuOids ?? []).includes(oid))
+      : true;
+    return hasIdentityMatch || (!status?.session && hasEkus);
   });
+}
+
+function configuredPkiMounts() {
+  return [...new Set((status?.profiles ?? [])
+    .map(profile => profile.pki_mount ?? profile.pkiMount)
+    .filter(Boolean))];
+}
+
+function pkiMountForCertificate(certificate) {
+  const matches = matchingConfiguredProfiles(certificate);
+  const profileMount = matches
+    .map(profile => profile.pki_mount ?? profile.pkiMount)
+    .find(Boolean);
+  if (profileMount) return profileMount;
+
+  const mounts = configuredPkiMounts();
+  return mounts.length === 1 ? mounts[0] : null;
+}
+
+function isKnownOpenBaoIssuer(certificate) {
+  const issuer = (certificate.issuer ?? "").toLowerCase();
+  return issuer.includes("northlake pki")
+    || issuer.includes("northlake identity issuing ca")
+    || issuer.includes("openbao");
+}
+
+function isAppManageableCertificate(certificate) {
+  return matchingConfiguredProfiles(certificate).length > 0 || isKnownOpenBaoIssuer(certificate);
+}
+
+function profileEkuWarning(certificate, profile) {
+  const expected = profileExpectedEkus(profile);
+  if (!expected.length) return "";
+  const missing = expected.filter(oid => !(certificate.ekuOids ?? []).includes(oid));
+  return missing.length ? ` Missing expected EKU ${missing.join(", ")}.` : "";
+}
+
+function latestProfileCertificate(profileId) {
+  const certificates = certificateStatuses.get(profileId) ?? [];
+  return [...certificates]
+    .filter(certificate => !isExpired(certificate))
+    .sort((a, b) => Date.parse(b.notAfter) - Date.parse(a.notAfter))[0] ?? null;
+}
+
+function certificateLifecycle(certificate) {
+  if (isExpired(certificate)) return { label: "Expired", className: "expired" };
+  const matches = matchingConfiguredProfiles(certificate);
+  if (!matches.length) {
+    return isKnownOpenBaoIssuer(certificate)
+      ? { label: "OpenBao-issued", className: "warning" }
+      : { label: "Not managed by this app", className: "neutral" };
+  }
+  const isCurrent = matches.some(profile => {
+    const latest = latestProfileCertificate(profile.id);
+    return latest?.thumbprint?.toLowerCase() === certificate.thumbprint?.toLowerCase();
+  });
+  if (isCurrent) return { label: "Current", className: "good" };
+  return { label: "Replaced / older", className: "warning" };
+}
+
+function expiringSoon(certificate, days = 14) {
+  const parsed = Date.parse(certificate.notAfter);
+  return !Number.isNaN(parsed) && parsed > Date.now() && parsed <= Date.now() + days * 24 * 60 * 60 * 1000;
 }
 
 function configuredProfileLabel(certificate) {
   const matches = matchingConfiguredProfiles(certificate);
-  if (!matches.length) return "";
+  if (!matches.length) {
+    return isKnownOpenBaoIssuer(certificate)
+      ? "Issued by a configured OpenBao issuer, but it does not match the current profile identity/EKU rules."
+      : "";
+  }
   const labels = matches.map(profile => profile.label).join(", ");
+  const warnings = matches.map(profile => profileEkuWarning(certificate, profile)).filter(Boolean).join(" ");
   const server = status?.serverSettings?.address ?? "the configured OpenBao server";
   return status?.session
-    ? `Matches configured OpenBao profile${matches.length > 1 ? "s" : ""} on ${server}: ${labels}`
+    ? `Matches configured OpenBao profile${matches.length > 1 ? "s" : ""} on ${server}: ${labels}.${warnings}`
     : `Matches configured OpenBao profile EKU${matches.length > 1 ? "s" : ""} on ${server}: ${labels}. Sign in to verify identity.`;
 }
 
@@ -212,27 +287,46 @@ async function refreshInstalledCertificates() {
     els.installedCertificates.innerHTML = relevant.length ? relevant.map(certificate => {
       const managed = configuredProfileLabel(certificate);
       const expired = isExpired(certificate);
+      const lifecycle = certificateLifecycle(certificate);
+      const soon = expiringSoon(certificate);
+      const appManageable = isAppManageableCertificate(certificate);
+      const pkiMount = pkiMountForCertificate(certificate);
       return `
       <div class="row cert-row">
         <div>
-          <p><strong>${escapeHtml(certificate.simpleName || certificate.subject)}</strong></p>
+          <p><strong>${escapeHtml(certificate.simpleName || certificate.subject)}</strong> <span class="status-pill ${escapeHtml(lifecycle.className)}">${escapeHtml(lifecycle.label)}</span>${soon ? ` <span class="status-pill warning">Expires soon</span>` : ""}</p>
           <p class="muted">${escapeHtml(certificatePurpose(certificate))}${certificate.hasPrivateKey ? " / private key available" : " / no private key"}</p>
           <p class="muted">${expired ? "Expired" : "Expires"} ${escapeHtml(formatCertificateDate(certificate.notAfter))}</p>
           <p class="muted">Issuer ${escapeHtml(certificate.issuer)}</p>
           ${managed ? `<p class="managed-note">${escapeHtml(managed)}</p>` : ""}
           ${certificate.emailNames?.length ? `<p class="muted">Email ${escapeHtml(certificate.emailNames.join(", "))}</p>` : ""}
           ${certificate.dnsNames?.length ? `<p class="muted">DNS ${escapeHtml(certificate.dnsNames.join(", "))}</p>` : ""}
+          <p class="meta">Serial ${escapeHtml(certificate.serialNumber)}</p>
           <p class="meta">Thumbprint ${escapeHtml(certificate.thumbprint)}</p>
         </div>
-        ${expired ? `<button class="danger" data-remove-cert="${escapeHtml(certificate.thumbprint)}">Remove expired</button>` : ""}
+        ${appManageable ? `<button class="danger" data-remove-cert="${escapeHtml(certificate.thumbprint)}" data-remove-cert-serial="${escapeHtml(certificate.serialNumber)}" data-remove-cert-mount="${escapeHtml(pkiMount ?? "")}" ${status?.session && pkiMount ? "" : "disabled"}>${expired ? "Revoke/remove expired" : "Revoke/remove"}</button>` : ""}
       </div>`;
     }).join("") : '<p class="muted">No client/signing/email certificates were found in CurrentUser\\My.</p>';
     document.querySelectorAll("[data-remove-cert]").forEach(button => button.addEventListener("click", async () => {
-      if (!confirm("Remove this expired certificate from CurrentUser\\My?")) return;
+      if (!status?.session) {
+        showMessage("Sign in before removing OpenBao-issued certificates so the app can revoke them first.", "error");
+        return;
+      }
+      if (!button.dataset.removeCertMount) {
+        showMessage("The app cannot infer which OpenBao PKI mount issued this certificate.", "error");
+        return;
+      }
+      if (!confirm("Revoke this certificate in OpenBao and remove it from CurrentUser\\My?")) return;
       button.disabled = true;
       try {
-        await invoke("remove_personal_certificate", { thumbprint: button.dataset.removeCert });
-        showMessage("Expired Windows certificate removed.");
+        await invoke("remove_personal_certificate", {
+          request: {
+            thumbprint: button.dataset.removeCert,
+            serialNumber: button.dataset.removeCertSerial,
+            pkiMount: button.dataset.removeCertMount,
+          }
+        });
+        showMessage("Certificate revoked in OpenBao and removed from Windows.");
         await refreshInstalledCertificates();
         await refreshCertificateStatus();
         renderProfiles();
@@ -249,12 +343,22 @@ async function refreshInstalledCertificates() {
 
 async function refreshYubiKeyCertificates() {
   try {
-    const slots = await invoke("list_yubikey_certificates");
-    els.yubikeyCertificates.innerHTML = slots.length ? slots.map(slot => {
+    yubiKeySlots = await invoke("list_yubikey_certificates");
+    els.yubikeyCertificates.innerHTML = yubiKeySlots.length ? yubiKeySlots.map(slot => {
       const certificate = slot.certificate;
       const managed = certificate ? configuredProfileLabel(certificate) : "";
       const expired = certificate ? isExpired(certificate) : false;
       const matches = certificate ? matchingConfiguredProfiles(certificate) : [];
+      const appManageable = certificate ? isAppManageableCertificate(certificate) : false;
+      const pkiMount = certificate ? pkiMountForCertificate(certificate) : null;
+      const lifecycle = certificate
+        ? expired ? { label: "Expired", className: "expired" } : { label: matches.length ? "Profile match" : isKnownOpenBaoIssuer(certificate) ? "OpenBao-issued" : "Not managed by this app", className: matches.length ? "good" : isKnownOpenBaoIssuer(certificate) ? "warning" : "neutral" }
+        : slot.hasPrivateKey ? { label: "Key only", className: "warning" } : { label: "Empty", className: "neutral" };
+      const keyDetails = [
+        slot.keyAlgorithm ? `key ${slot.keyAlgorithm}` : slot.hasPrivateKey ? "key present" : "",
+        slot.pinPolicy ? `PIN ${slot.pinPolicy}` : "",
+        slot.touchPolicy ? `touch ${slot.touchPolicy}` : "",
+      ].filter(Boolean).join(" / ");
       const statusText = certificate
         ? `${certificatePurpose(certificate)} / ${slot.hasPrivateKey ? "hardware private key present" : "certificate only"}`
         : slot.hasPrivateKey
@@ -263,8 +367,9 @@ async function refreshYubiKeyCertificates() {
       return `
       <div class="row cert-row">
         <div>
-          <p><strong>Slot ${escapeHtml(slot.slot)} - ${escapeHtml(slot.label)}</strong></p>
+          <p><strong>Slot ${escapeHtml(slot.slot)} - ${escapeHtml(slot.label)}</strong> <span class="status-pill ${escapeHtml(lifecycle.className)}">${escapeHtml(lifecycle.label)}</span></p>
           <p class="muted">${escapeHtml(statusText)}</p>
+          ${keyDetails ? `<p class="muted">${escapeHtml(keyDetails)}</p>` : ""}
           ${certificate ? `
             <p class="muted">${escapeHtml(certificate.simpleName || certificate.subject)}</p>
             <p class="muted">${expired ? "Expired" : "Expires"} ${escapeHtml(formatCertificateDate(certificate.notAfter))}</p>
@@ -272,12 +377,13 @@ async function refreshYubiKeyCertificates() {
             ${managed ? `<p class="managed-note">${escapeHtml(managed)}</p>` : ""}
             ${certificate.emailNames?.length ? `<p class="muted">Email ${escapeHtml(certificate.emailNames.join(", "))}</p>` : ""}
             ${certificate.dnsNames?.length ? `<p class="muted">DNS ${escapeHtml(certificate.dnsNames.join(", "))}</p>` : ""}
+            <p class="meta">Serial ${escapeHtml(certificate.serialNumber)}</p>
             <p class="meta">Thumbprint ${escapeHtml(certificate.thumbprint)}</p>
           ` : ""}
         </div>
-        ${expired ? `<div class="button-column">
+        ${appManageable ? `<div class="button-column">
           ${matches[0] ? `<button data-yubikey-rerequest="${escapeHtml(matches[0].id)}" data-yubikey-slot-renew="${escapeHtml(slot.slot)}" ${status?.session ? "" : "disabled"}>Re-request</button>` : ""}
-          <button class="danger" data-remove-yubikey-cert="${escapeHtml(slot.slot)}">Remove expired</button>
+          <button class="danger" data-remove-yubikey-cert="${escapeHtml(slot.slot)}" data-remove-yubikey-serial="${escapeHtml(certificate.serialNumber)}" data-remove-yubikey-mount="${escapeHtml(pkiMount ?? "")}" ${status?.session && pkiMount ? "" : "disabled"}>${expired ? "Revoke/remove expired" : "Revoke/remove"}</button>
         </div>` : ""}
       </div>`;
     }).join("") : '<p class="muted">No YubiKey PIV slots were reported.</p>';
@@ -290,17 +396,27 @@ async function refreshYubiKeyCertificates() {
         els.yubikeyPin.focus();
         return;
       }
-      if (!confirm(`Remove the expired certificate from YubiKey PIV slot ${button.dataset.removeYubikeyCert}? The private key remains on the YubiKey.`)) return;
+      if (!status?.session) {
+        showMessage("Sign in before removing OpenBao-issued certificates so the app can revoke them first.", "error");
+        return;
+      }
+      if (!button.dataset.removeYubikeyMount) {
+        showMessage("The app cannot infer which OpenBao PKI mount issued this certificate.", "error");
+        return;
+      }
+      if (!confirm(`Revoke this certificate in OpenBao and remove it from YubiKey PIV slot ${button.dataset.removeYubikeyCert}? The private key remains on the YubiKey.`)) return;
       button.disabled = true;
       try {
         await invoke("remove_yubikey_certificate", {
           request: {
             slot: button.dataset.removeYubikeyCert,
+            serialNumber: button.dataset.removeYubikeySerial,
+            pkiMount: button.dataset.removeYubikeyMount,
             pin: els.yubikeyPin.value,
             managementKey: els.yubikeyManagementKey.value || null,
           }
         });
-        showMessage("Expired YubiKey certificate removed. The private key remains in the slot.");
+        showMessage("Certificate revoked in OpenBao and removed from the YubiKey slot. The private key remains in the slot.");
         await refreshYubiKeyCertificates();
       } catch (error) {
         showMessage(String(error), "error");
@@ -321,17 +437,21 @@ function renderProfiles() {
   }
   els.profiles.innerHTML = profiles.map(profile => {
     const installed = certificateStatuses.get(profile.id) ?? [];
-    const latest = [...installed].sort((a, b) => Date.parse(b.notAfter) - Date.parse(a.notAfter))[0];
+    const expired = installed.filter(isExpired);
+    const active = installed.filter(certificate => !isExpired(certificate));
+    const latest = [...active].sort((a, b) => Date.parse(b.notAfter) - Date.parse(a.notAfter))[0]
+      ?? [...expired].sort((a, b) => Date.parse(b.notAfter) - Date.parse(a.notAfter))[0];
     const latestExpired = latest ? isExpired(latest) : false;
+    const olderCount = Math.max(0, active.length - (latest && !latestExpired ? 1 : 0));
     const detail = latest
-      ? `${latestExpired ? "Expired" : "Installed"} / ${formatCertificateDate(latest.notAfter)}${installed.length > 1 ? ` / ${installed.length} matching` : ""}`
+      ? `${latestExpired ? "Expired" : "Current"} / ${formatCertificateDate(latest.notAfter)}${expired.length ? ` / ${expired.length} expired` : ""}${olderCount ? ` / ${olderCount} older active` : ""}`
       : profile.description;
     return `
     <div class="row request-row">
       <div>
         <p><strong>${escapeHtml(profile.label)}</strong></p>
         <p class="muted">${escapeHtml(detail)}</p>
-        <p class="muted">Windows native / key generated in Microsoft Software Key Storage Provider.</p>
+        <p class="muted">Windows native / key generated in Microsoft Software Key Storage Provider. Remove expired copies from the Installed certificates section.</p>
       </div>
       <button data-profile="${escapeHtml(profile.id)}" data-replace="${installed.length > 0}" ${status.session ? "" : "disabled"}>${latestExpired ? "Re-request expired" : installed.length ? "Replace" : "Request"}</button>
     </div>`;
@@ -365,17 +485,29 @@ function renderYubiKeyProfiles() {
     els.yubikeyProfiles.innerHTML = '<p class="muted">No certificate profiles are configured.</p>';
     return;
   }
-  els.yubikeyProfiles.innerHTML = profiles.map(profile => `
+  els.yubikeyProfiles.innerHTML = profiles.map(profile => {
+    const defaultSlot = profile.purpose === "mtls" ? "9a" : "9c";
+    return `
     <div class="row request-row">
       <div>
         <p><strong>${escapeHtml(profile.label)}</strong></p>
         <p class="muted">YubiKey-backed ${escapeHtml(profile.purpose)} certificate for web or desktop app client authentication.</p>
         <p class="muted">Requires YubiKey Manager CLI (ykman). The private key is generated on the YubiKey PIV slot.</p>
       </div>
+      <label class="inline-field">Slot
+        <select data-yubikey-slot-for="${escapeHtml(profile.id)}">
+          <option value="9a" ${defaultSlot === "9a" ? "selected" : ""}>9a Auth</option>
+          <option value="9c" ${defaultSlot === "9c" ? "selected" : ""}>9c Signature</option>
+          <option value="9d">9d Key mgmt</option>
+          <option value="9e">9e Card auth</option>
+        </select>
+      </label>
       <button data-yubikey-profile="${escapeHtml(profile.id)}" ${status.session ? "" : "disabled"}>Request on YubiKey</button>
-    </div>`).join("");
+    </div>`;
+  }).join("");
   document.querySelectorAll("[data-yubikey-profile]").forEach(button => button.addEventListener("click", async () => {
-    await requestYubiKeyCertificate(button.dataset.yubikeyProfile, els.yubikeySlot.value, false, button);
+    const slotSelector = document.querySelector(`[data-yubikey-slot-for="${CSS.escape(button.dataset.yubikeyProfile)}"]`);
+    await requestYubiKeyCertificate(button.dataset.yubikeyProfile, slotSelector?.value ?? els.yubikeySlot.value, false, button);
   }));
 }
 
@@ -388,6 +520,11 @@ async function requestYubiKeyCertificate(profileId, slot, replaceExisting, butto
   const prompt = replaceExisting
     ? `Re-request this certificate using the existing key on YubiKey PIV slot ${slot}?`
     : `Generate a new key on YubiKey PIV slot ${slot} and request this certificate?\n\nThis build will not overwrite an existing YubiKey key or certificate unless you use Re-request for an expired YubiKey certificate.`;
+  const currentSlot = yubiKeySlots.find(item => item.slot === slot);
+  if (!replaceExisting && (currentSlot?.hasPrivateKey || currentSlot?.certificate)) {
+    showMessage(`YubiKey slot ${slot} is not empty. Choose an empty slot or use Re-request on an expired certificate.`, "error");
+    return;
+  }
   if (!confirm(prompt)) return;
   button.disabled = true;
   showMessage("YubiKey request running. If the YubiKey starts blinking, touch its metal contact now; there may not be a separate Windows prompt.", "warning");
