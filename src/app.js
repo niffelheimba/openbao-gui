@@ -235,6 +235,25 @@ function profileEkuWarning(certificate, profile) {
   return missing.length ? ` Missing expected EKU ${missing.join(", ")}.` : "";
 }
 
+function tlsReadiness(certificate) {
+  const eku = new Set(certificate.ekuOids ?? []);
+  if (eku.has("1.3.6.1.5.5.7.3.2")) {
+    return { label: "TLS client-auth ready", className: "good", message: "" };
+  }
+  if (!eku.size) {
+    return {
+      label: "No client-auth EKU",
+      className: "warning",
+      message: "This certificate has no Enhanced Key Usage. Some TLS servers reject client certificates unless Client Authentication EKU is present.",
+    };
+  }
+  return {
+    label: "Missing client-auth EKU",
+    className: "expired",
+    message: "This certificate is not marked for TLS client authentication.",
+  };
+}
+
 function latestProfileCertificate(profileId) {
   const certificates = certificateStatuses.get(profileId) ?? [];
   return [...certificates]
@@ -291,11 +310,13 @@ async function refreshInstalledCertificates() {
       const soon = expiringSoon(certificate);
       const appManageable = isAppManageableCertificate(certificate);
       const pkiMount = pkiMountForCertificate(certificate);
+      const tls = tlsReadiness(certificate);
       return `
       <div class="row cert-row">
         <div>
-          <p><strong>${escapeHtml(certificate.simpleName || certificate.subject)}</strong> <span class="status-pill ${escapeHtml(lifecycle.className)}">${escapeHtml(lifecycle.label)}</span>${soon ? ` <span class="status-pill warning">Expires soon</span>` : ""}</p>
+          <p><strong>${escapeHtml(certificate.simpleName || certificate.subject)}</strong> <span class="status-pill ${escapeHtml(lifecycle.className)}">${escapeHtml(lifecycle.label)}</span> <span class="status-pill ${escapeHtml(tls.className)}">${escapeHtml(tls.label)}</span>${soon ? ` <span class="status-pill warning">Expires soon</span>` : ""}</p>
           <p class="muted">${escapeHtml(certificatePurpose(certificate))}${certificate.hasPrivateKey ? " / private key available" : " / no private key"}</p>
+          ${tls.message ? `<p class="warning-note">${escapeHtml(tls.message)}</p>` : ""}
           <p class="muted">${expired ? "Expired" : "Expires"} ${escapeHtml(formatCertificateDate(certificate.notAfter))}</p>
           <p class="muted">Issuer ${escapeHtml(certificate.issuer)}</p>
           ${managed ? `<p class="managed-note">${escapeHtml(managed)}</p>` : ""}
@@ -304,7 +325,7 @@ async function refreshInstalledCertificates() {
           <p class="meta">Serial ${escapeHtml(certificate.serialNumber)}</p>
           <p class="meta">Thumbprint ${escapeHtml(certificate.thumbprint)}</p>
         </div>
-        ${appManageable ? `<button class="danger" data-remove-cert="${escapeHtml(certificate.thumbprint)}" data-remove-cert-serial="${escapeHtml(certificate.serialNumber)}" data-remove-cert-mount="${escapeHtml(pkiMount ?? "")}" ${status?.session && pkiMount ? "" : "disabled"}>${expired ? "Revoke/remove expired" : "Revoke/remove"}</button>` : ""}
+        ${appManageable ? `<button class="danger" data-remove-cert="${escapeHtml(certificate.thumbprint)}" data-remove-cert-serial="${escapeHtml(certificate.serialNumber)}" data-remove-cert-mount="${escapeHtml(pkiMount ?? "")}" ${status?.session && pkiMount ? "" : "disabled"}>${expired ? "Revoke/remove expired" : "Revoke/remove"}</button>` : expired ? `<button class="danger" data-remove-local-cert="${escapeHtml(certificate.thumbprint)}">Remove local expired</button>` : ""}
       </div>`;
     }).join("") : '<p class="muted">No client/signing/email certificates were found in CurrentUser\\My.</p>';
     document.querySelectorAll("[data-remove-cert]").forEach(button => button.addEventListener("click", async () => {
@@ -336,6 +357,26 @@ async function refreshInstalledCertificates() {
         button.disabled = false;
       }
     }));
+    document.querySelectorAll("[data-remove-local-cert]").forEach(button => button.addEventListener("click", async () => {
+      if (!confirm("Remove this expired certificate from CurrentUser\\My only? This will not touch the smart card or revoke anything in OpenBao.")) return;
+      button.disabled = true;
+      try {
+        await invoke("remove_personal_certificate", {
+          request: {
+            thumbprint: button.dataset.removeLocalCert,
+            serialNumber: "",
+            pkiMount: null,
+            revoke: false,
+          }
+        });
+        showMessage("Expired local certificate removed from Windows.");
+        await refreshInstalledCertificates();
+      } catch (error) {
+        showMessage(String(error), "error");
+      } finally {
+        button.disabled = false;
+      }
+    }));
   } catch (error) {
     els.installedCertificates.innerHTML = `<p class="muted">${escapeHtml(error)}</p>`;
   }
@@ -351,6 +392,10 @@ async function refreshYubiKeyCertificates() {
       const matches = certificate ? matchingConfiguredProfiles(certificate) : [];
       const appManageable = certificate ? isAppManageableCertificate(certificate) : false;
       const pkiMount = certificate ? pkiMountForCertificate(certificate) : null;
+      const tls = certificate ? tlsReadiness(certificate) : null;
+      const slotWarning = certificate && slot.slot !== "9a"
+        ? "For browser mTLS, slot 9a / Authentication is the most compatible PIV slot. Other slots may trigger smart-card operation errors in Windows."
+        : "";
       const lifecycle = certificate
         ? expired ? { label: "Expired", className: "expired" } : { label: matches.length ? "Profile match" : isKnownOpenBaoIssuer(certificate) ? "OpenBao-issued" : "Not managed by this app", className: matches.length ? "good" : isKnownOpenBaoIssuer(certificate) ? "warning" : "neutral" }
         : slot.hasPrivateKey ? { label: "Key only", className: "warning" } : { label: "Empty", className: "neutral" };
@@ -367,8 +412,10 @@ async function refreshYubiKeyCertificates() {
       return `
       <div class="row cert-row">
         <div>
-          <p><strong>Slot ${escapeHtml(slot.slot)} - ${escapeHtml(slot.label)}</strong> <span class="status-pill ${escapeHtml(lifecycle.className)}">${escapeHtml(lifecycle.label)}</span></p>
+          <p><strong>Slot ${escapeHtml(slot.slot)} - ${escapeHtml(slot.label)}</strong> <span class="status-pill ${escapeHtml(lifecycle.className)}">${escapeHtml(lifecycle.label)}</span>${tls ? ` <span class="status-pill ${escapeHtml(tls.className)}">${escapeHtml(tls.label)}</span>` : ""}</p>
           <p class="muted">${escapeHtml(statusText)}</p>
+          ${tls?.message ? `<p class="warning-note">${escapeHtml(tls.message)}</p>` : ""}
+          ${slotWarning ? `<p class="warning-note">${escapeHtml(slotWarning)}</p>` : ""}
           ${keyDetails ? `<p class="muted">${escapeHtml(keyDetails)}</p>` : ""}
           ${certificate ? `
             <p class="muted">${escapeHtml(certificate.simpleName || certificate.subject)}</p>

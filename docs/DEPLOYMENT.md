@@ -155,6 +155,35 @@ bao write pki_user_mtls/config/crl `
   auto_rebuild=true `
   auto_rebuild_grace_period="24h" `
   enable_delta=false
+bao write pki_user_mtls/roles/northlake-users `
+  allow_any_name=true `
+  allow_bare_domains=false `
+  allow_glob_domains=false `
+  allow_ip_sans=false `
+  allow_localhost=false `
+  allow_subdomains=false `
+  allow_wildcard_certificates=false `
+  client_flag=true `
+  server_flag=false `
+  code_signing_flag=false `
+  email_protection_flag=false `
+  ext_key_usage=ClientAuth `
+  key_usage=DigitalSignature `
+  key_type=any `
+  key_bits=0 `
+  country=US `
+  organization=Northlake `
+  ou="Northlake Users" `
+  require_cn=true `
+  cn_validations=email,hostname `
+  enforce_hostnames=false `
+  use_csr_common_name=true `
+  use_csr_sans=false `
+  ttl=720h `
+  max_ttl=2160h `
+  not_before_duration=5m `
+  generate_lease=false `
+  no_store=false
 
 bao secrets enable `
   -path=pki_internal_server_tls `

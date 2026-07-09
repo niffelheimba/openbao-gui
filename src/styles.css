@@ -29,6 +29,7 @@ h2 { margin-bottom: 5px; font-size: 17px; }
 .disabled-row { opacity: .72; }
 .button-column { display: grid; gap: 8px; justify-items: end; }
 .managed-note { display: inline-block; margin-top: 5px; border-radius: 999px; background: #e4f4ec; color: #17633f; font-size: 12px; font-weight: 650; padding: 4px 8px; }
+.warning-note { margin-top: 5px; border-radius: 9px; background: #fff0ce; color: #714f0c; font-size: 12px; padding: 7px 9px; }
 .status-pill { display: inline-block; vertical-align: middle; margin-left: 6px; border-radius: 999px; background: #e4e9e6; color: #56625c; font-size: 11px; font-weight: 750; padding: 3px 7px; }
 .status-pill.good { background: #d8f2e4; color: #17633f; }
 .status-pill.warning { background: #fff0ce; color: #714f0c; }
@@ -72,6 +73,7 @@ footer { padding: 8px 4px; }
   .row { border-color: #2b3932; }
   .section-heading p, .muted, footer, .meta { color: #9baaa2; }
   .managed-note { background: #203b30; color: #b7e5cf; }
+  .warning-note { background: #463715; color: #ffe1a0; }
   .status-pill.neutral { background: #26302c; color: #aab7b1; }
   .status-pill.good { background: #203b30; color: #b7e5cf; }
   .status-pill.warning { background: #463715; color: #ffe1a0; }

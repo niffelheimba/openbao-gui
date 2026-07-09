@@ -697,6 +697,12 @@ struct RemoveCertificateRequest {
     thumbprint: Option<String>,
     serial_number: String,
     pki_mount: Option<String>,
+    #[serde(default = "default_true")]
+    revoke: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(serde::Deserialize)]
@@ -823,16 +829,18 @@ async fn remove_personal_certificate(
         .thumbprint
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| AppError::Certificate("certificate thumbprint is required".into()))?;
-    let pki_mount = infer_certificate_pki_mount(&state.config, request.pki_mount.as_deref())?;
-    let token = with_active_session(&state, |session| {
-        Ok(SecretString::from(session.token.expose_secret().to_owned()))
-    })
-    .await?;
-    let serial_number = certificates::normalize_certificate_serial(&request.serial_number);
-    state
-        .api
-        .revoke_certificate(&token, &pki_mount, &serial_number)
+    if request.revoke {
+        let pki_mount = infer_certificate_pki_mount(&state.config, request.pki_mount.as_deref())?;
+        let token = with_active_session(&state, |session| {
+            Ok(SecretString::from(session.token.expose_secret().to_owned()))
+        })
         .await?;
+        let serial_number = certificates::normalize_certificate_serial(&request.serial_number);
+        state
+            .api
+            .revoke_certificate(&token, &pki_mount, &serial_number)
+            .await?;
+    }
     tokio::task::spawn_blocking(move || certificates::remove_personal_certificate(&thumbprint))
         .await
         .map_err(|_| AppError::Internal)?
